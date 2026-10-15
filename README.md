@@ -2,7 +2,7 @@
 
 An independent, experimental Rust image/video and one-scene wallpaper player
 for Linux Wayland compositors implementing `wlr-layer-shell`, tested with Sway.
-It is not a full Wallpaper Engine clone or a REA analysis provider. No Steam,
+It is not a full Wallpaper Engine clone. No Steam,
 Wine, or Wallpaper Engine executable is launched.
 
 Rust owns project selection, image decoding, bounded frame delivery, shared-memory
@@ -16,12 +16,12 @@ package supplies FFmpeg without changing the system configuration.
 From this directory:
 
 ```bash
-nix build path:.
-nix run path:. -- outputs
-nix run path:. -- inspect /absolute/path/to/image.jpg
-nix run path:. -- check /absolute/path/to/image.jpg
-nix run path:. -- play /absolute/path/to/image.jpg --output eDP-1
-nix run path:. -- play /absolute/path/to/video.mp4 --output eDP-1 --fps 30 --fit cover
+nix build .
+nix run . -- outputs
+nix run . -- inspect /absolute/path/to/image.jpg
+nix run . -- check /absolute/path/to/image.jpg
+nix run . -- play /absolute/path/to/image.jpg --output eDP-1
+nix run . -- play /absolute/path/to/video.mp4 --output eDP-1 --fps 30 --fit cover
 ```
 
 Use an exact output name returned by `outputs`. Without `--output`, the first
@@ -67,9 +67,9 @@ explicit `--preview` selects only the declared static preview and reports
 
 ```bash
 project="$HOME/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach"
-nix run path:. -- inspect "$project" --preview
-nix run path:. -- check "$project" --preview --width 640 --height 360
-nix run path:. -- play "$project" --preview --output eDP-1 --duration-seconds 15
+nix run . -- inspect "$project" --preview
+nix run . -- check "$project" --preview --width 640 --height 360
+nix run . -- play "$project" --preview --output eDP-1 --duration-seconds 15
 ```
 
 The final command changes the chosen output temporarily. `inspect` only resolves
@@ -104,10 +104,10 @@ The input contract was investigated from the locally installed Wallpaper Engine
   `TEXB0003` with DXT5 payloads; their decoded dimensions match the shipped
   2048×1024, 32×32, and 512×512 images.
 
-Earlier REA static analysis covered `distribution/wallpaper64.exe` resource
+Earlier static analysis covered `distribution/wallpaper64.exe` resource
 metadata and the selected `ui/dist/scripts/scripts.js` bundle. That does not
 recover the native renderer: Ghidra was unavailable, bundle semantic coverage
-was partial, and no native rendering code was decompiled. This MVP is a new
+was partial, and no native rendering code was decompiled. This project is a new
 implementation of a narrower behavior, not recovered proprietary source.
 No Wallpaper Engine code, assets, shaders, project files, or other binaries are
 included here. Local ownership does not establish redistribution rights.
@@ -118,7 +118,7 @@ included here. Local ownership does not establish redistribution rights.
 cargo test --locked
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
-nix flake check path:.
+nix flake check .
 ```
 
 The default Cargo test run explicitly ignores tests requiring external programs.
@@ -126,7 +126,7 @@ The Nix package runs the real FFmpeg decoding/loop/cleanup test as well as the
 ordinary unit and public CLI tests. For the explicit real-provider lanes:
 
 ```bash
-nix develop path:.
+nix develop .
 export WALLPAPER_TEST_FFMPEG="$(command -v ffmpeg)"
 export WALLPAPER_TEST_SCENE_ROOT=/absolute/path/to/eagleflag
 cargo test --locked --lib --bins --test cli --test scene -- --include-ignored
@@ -160,3 +160,7 @@ decoder threads, not a process-wide memory cap. It may access local files but
 network protocols are disabled. This is not a sandbox for untrusted media;
 decoder internals, total CPU/memory usage, and 4K/60-fps performance are not
 bounded or benchmarked here.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

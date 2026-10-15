@@ -3,7 +3,10 @@ name = "wallbreak"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
+authors = ["flakesonnix"]
 description = "Experimental image/video and one-scene wallpaper player for Wayland layer-shell compositors"
+homepage = "https://github.com/flakesonnix/wallbreak"
+repository = "https://github.com/flakesonnix/wallbreak"
 license = "MIT"
 publish = false
 
