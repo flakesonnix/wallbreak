@@ -20,6 +20,9 @@ texture2ddecoder = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"
+rustix = { version = "1.1", features = ["fs", "process"] }
+url = "2.5"
+zbus = "=5.13.2"
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = "0.31"
 eframe = { version = "0.28", default-features = false, features = [
@@ -36,6 +39,10 @@ name = "wallbreak-gui"
 path = "src/bin/wallbreak-gui.rs"
 required-features = ["gui"]
 
+[[bin]]
+name = "wallbreak-renderer"
+path = "src/bin/wallbreak-renderer.rs"
+required-features = ["gui"]
+
 [dev-dependencies]
-rustix = { version = "1.1", features = ["process"] }
 tempfile = "3.20"

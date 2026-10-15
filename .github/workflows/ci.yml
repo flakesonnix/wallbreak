@@ -7,11 +7,19 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      WALLBREAK_TEST_DBUS_DAEMON: /usr/bin/dbus-daemon
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --experimental-vm-modules --test tests/gnome-extension.test.mjs
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: cargo clippy --locked --features gui --all-targets -- -D warnings
+      - run: cargo test --locked --features gui

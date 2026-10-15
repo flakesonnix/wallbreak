@@ -10,7 +10,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use wallbreak::{
-    display,
+    display, gnome,
     media::{Fit, MediaWorker, PlaybackOptions},
     project, steam,
 };
@@ -37,7 +37,9 @@ enum Action {
     Outputs,
     /// List installed Wallpaper Engine projects from local Steam libraries.
     Projects,
-    /// Show an input-transparent background on one output until Ctrl-C.
+    /// Print the optional GNOME 50 extension archive path; never install or enable it.
+    GnomeExtension,
+    /// Play until Ctrl-C: one layer-shell output, or a static image on all GNOME displays.
     Play {
         path: PathBuf,
         /// Select the project's static preview instead of rendering its scene or web content.
@@ -92,6 +94,19 @@ fn main() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&steam::scan(&steam::default_roots()))?,
         ),
+        Action::GnomeExtension => {
+            let path = PathBuf::from(std::env::var_os("WALLBREAK_GNOME_EXTENSION_ZIP")
+                .context("GNOME extension archive not configured; use the Nix package to obtain the optional bridge")?);
+            ensure!(
+                path.is_absolute() && path.is_file(),
+                "GNOME extension archive is unavailable"
+            );
+            println!(
+                "{}",
+                path.to_str()
+                    .context("GNOME extension archive path is not UTF-8")?
+            );
+        }
         Action::Play {
             path,
             preview,
@@ -111,7 +126,11 @@ fn main() -> Result<()> {
                 ffmpeg,
                 duration: duration_seconds.map(Duration::from_secs),
             };
-            display::run(media, options, output, stop)?;
+            if gnome::is_current() {
+                gnome::run(&media, &options, output.as_deref(), stop)?;
+            } else {
+                display::run(media, options, output, stop)?;
+            }
         }
         Action::Check {
             path,

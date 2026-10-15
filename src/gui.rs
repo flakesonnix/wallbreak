@@ -5,11 +5,19 @@
 //! through the library, without touching Wayland or the desktop.
 
 use std::{
+    io::{self, Read},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
+use rustix::process::{kill_process, Pid, Signal};
 
 use crate::{
     display,
@@ -19,12 +27,29 @@ use crate::{
 
 /// A managed `wallbreak play` child process.
 ///
-/// Dropping the player terminates and reaps the child, so a closed panel can
-/// never leak a wallpaper surface.
+/// Stop and Drop request graceful cleanup before escalating, for this child only.
 #[derive(Default)]
 pub struct Player {
     child: Option<Child>,
     description: String,
+    exit_status: Option<ExitStatus>,
+    diagnostics: Arc<Mutex<Diagnostics>>,
+    cancel_reader: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+    forced: bool,
+}
+
+const STDERR_LIMIT: usize = 32 * 1024;
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const TERM_GRACE: Duration = Duration::from_secs(2);
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct Diagnostics {
+    bytes: Vec<u8>,
+    truncated: bool,
+    incomplete: bool,
+    error: Option<String>,
 }
 
 impl Player {
@@ -32,14 +57,51 @@ impl Player {
         Self::default()
     }
 
-    pub fn is_running(&mut self) -> bool {
+    /// Poll without relinquishing ownership if waiting fails.
+    pub fn is_running(&mut self) -> Result<bool> {
         if let Some(child) = &mut self.child {
-            match child.try_wait() {
-                Ok(None) => return true,
-                _ => self.child = None,
+            match child.try_wait().context("cannot poll wallpaper process")? {
+                None => return Ok(true),
+                Some(status) => {
+                    self.exit_status = Some(status);
+                    self.child = None;
+                }
             }
         }
-        false
+        self.finish_stderr()?;
+        Ok(false)
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.child.is_some() || self.reader.is_some()
+    }
+
+    pub fn exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status
+    }
+
+    /// Retain the stderr tail, including explicit coverage and cleanup warnings.
+    pub fn diagnostics(&self) -> String {
+        let diagnostics = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = String::new();
+        if diagnostics.truncated {
+            text.push_str(&format!(
+                "[stderr truncated; showing the last {STDERR_LIMIT} bytes]\n"
+            ));
+        }
+        text.push_str(&String::from_utf8_lossy(&diagnostics.bytes));
+        if diagnostics.incomplete {
+            text.push_str("\n[stderr capture stopped before EOF]\n");
+        }
+        if let Some(error) = &diagnostics.error {
+            text.push_str(&format!("\n[stderr capture failed: {error}]\n"));
+        }
+        if self.forced {
+            text.push_str(
+                "\n[Player required SIGKILL; wallpaper restoration may not have completed.]\n",
+            );
+        }
+        text
     }
 
     pub fn description(&self) -> &str {
@@ -49,33 +111,140 @@ impl Player {
     /// Start any program with arguments, replacing a running player.
     pub fn start(&mut self, program: &PathBuf, args: &[String], description: String) -> Result<()> {
         self.stop()?;
+        self.exit_status = None;
+        self.forced = false;
+        self.diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
+        self.cancel_reader = Arc::new(AtomicBool::new(false));
         let child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("cannot start {}", program.display()))?;
         self.child = Some(child);
         self.description = description;
+        // Keep the child owner installed before any fallible reader setup.
+        let setup = (|| -> Result<()> {
+            let mut stderr = self
+                .child
+                .as_mut()
+                .and_then(|child| child.stderr.take())
+                .context("player stderr pipe is missing")?;
+            rustix::io::ioctl_fionbio(&stderr, true)
+                .context("cannot make player stderr nonblocking")?;
+            let diagnostics = self.diagnostics.clone();
+            let cancel = self.cancel_reader.clone();
+            self.reader = Some(
+                thread::Builder::new()
+                    .name("player-stderr".into())
+                    .spawn(move || {
+                        let mut buffer = [0; 4096];
+                        let mut cancelled_at = None;
+                        loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                let start = cancelled_at.get_or_insert_with(Instant::now);
+                                // A descendant may keep writing or hold the pipe open. Do not
+                                // wait for its lifetime, even while draining the final bytes.
+                                if start.elapsed() >= Duration::from_millis(100) {
+                                    diagnostics.lock().unwrap().incomplete = true;
+                                    break;
+                                }
+                            }
+                            match stderr.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    let mut diagnostics = diagnostics.lock().unwrap();
+                                    let excess =
+                                        (diagnostics.bytes.len() + n).saturating_sub(STDERR_LIMIT);
+                                    if excess > 0 {
+                                        diagnostics.bytes.drain(..excess);
+                                        diagnostics.truncated = true;
+                                    }
+                                    diagnostics.bytes.extend_from_slice(&buffer[..n]);
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    if cancelled_at.is_some() {
+                                        diagnostics.lock().unwrap().incomplete = true;
+                                        break;
+                                    }
+                                    thread::sleep(POLL_INTERVAL);
+                                }
+                                Err(error) => {
+                                    diagnostics.lock().unwrap().error = Some(error.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .context("cannot start player stderr reader")?,
+            );
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            return Err(match self.stop() {
+                Ok(()) => error,
+                Err(cleanup) => error.context(format!("player cleanup also failed: {cleanup:#}")),
+            });
+        }
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        if let Some(mut child) = self.child.take() {
-            if child.try_wait()?.is_none() {
-                child.kill().context("cannot terminate wallpaper process")?;
+        if self.is_running()? {
+            // An unreaped, owned Child pins this PID against reuse.
+            let pid = Pid::from_child(self.child.as_ref().unwrap());
+            match kill_process(pid, Signal::TERM) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => return Err(error).context("cannot send TERM to wallpaper process"),
             }
-            child.wait().context("cannot reap wallpaper process")?;
+            let mut deadline = Instant::now() + TERM_GRACE;
+            let mut escalated = false;
+            while self.is_running()? {
+                if Instant::now() >= deadline {
+                    anyhow::ensure!(
+                        !escalated,
+                        "wallpaper process has not exited after SIGKILL; cleanup is still pending"
+                    );
+                    match kill_process(pid, Signal::KILL) {
+                        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                        Err(error) => {
+                            return Err(error).context("cannot send KILL to wallpaper process")
+                        }
+                    }
+                    self.forced = true;
+                    escalated = true;
+                    deadline = Instant::now() + KILL_GRACE;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
         }
         self.description.clear();
+        Ok(())
+    }
+
+    fn finish_stderr(&mut self) -> Result<()> {
+        self.cancel_reader.store(true, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            reader.join().map_err(|_| {
+                self.diagnostics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .error = Some("reader thread panicked".into());
+                anyhow::anyhow!("player stderr reader panicked")
+            })?;
+        }
         Ok(())
     }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if let Err(error) = self.stop() {
+            eprintln!("wallbreak: player cleanup failed: {error:#}");
+            let _ = self.finish_stderr();
+        }
     }
 }
 
@@ -172,36 +341,30 @@ mod tests {
     }
 
     #[test]
-    fn player_starts_and_stops_an_owned_process() {
+    fn wait_failure_retains_the_child_and_prevents_replacement() {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_child(&child);
+        // Deliberately reap outside Child to provoke a real ECHILD wait failure.
+        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()).unwrap();
         let mut player = Player::new();
-        assert!(!player.is_running());
-        player
-            .start(&PathBuf::from("sleep"), &["30".to_string()], "sleep".into())
-            .unwrap();
-        assert!(player.is_running());
-        assert_eq!(player.description(), "sleep");
-        player.stop().unwrap();
-        assert!(!player.is_running());
-        assert!(player.description().is_empty());
-    }
-
-    #[test]
-    fn player_replaces_a_running_process() {
-        let mut player = Player::new();
-        player
-            .start(&PathBuf::from("sleep"), &["30".to_string()], "first".into())
-            .unwrap();
-        let first = player.child.as_ref().unwrap().id();
-        player
-            .start(
-                &PathBuf::from("sleep"),
-                &["30".to_string()],
-                "second".into(),
-            )
-            .unwrap();
-        assert_ne!(player.child.as_ref().unwrap().id(), first);
-        assert_eq!(player.description(), "second");
-        player.stop().unwrap();
+        player.child = Some(child);
+        assert!(player
+            .is_running()
+            .unwrap_err()
+            .to_string()
+            .contains("poll"));
+        assert!(player.has_pending_work());
+        assert!(player.stop().is_err());
+        assert_eq!(Pid::from_child(player.child.as_ref().unwrap()), pid);
+        assert!(player
+            .start(&PathBuf::from("must-not-run"), &[], "new".into())
+            .is_err());
+        assert_eq!(Pid::from_child(player.child.as_ref().unwrap()), pid);
+        assert!(player.exit_status().is_none());
     }
 
     #[test]
@@ -306,7 +469,11 @@ pub mod panel {
                         self.output.clear();
                     }
                     self.outputs = outputs;
-                    self.status = "Outputs refreshed.".to_string();
+                    self.status = if crate::gnome::is_current() {
+                        "GNOME: images use all displays; animation requires the optional Shell bridge and defaults to the primary display.".into()
+                    } else {
+                        "Outputs refreshed.".into()
+                    };
                 }
                 Err(error) => self.status = format!("Outputs failed: {error:#}"),
             }
@@ -397,7 +564,9 @@ pub mod panel {
                     .unwrap_or_else(|| "default output".to_string())
             );
             match self.player.start(&binary, &args, description) {
-                Ok(()) => self.status = "Playing. Stop removes the wallpaper.".to_string(),
+                Ok(()) => {
+                    self.status = "Starting player. Stop requests wallpaper cleanup.".to_string()
+                }
                 Err(error) => self.status = format!("Play failed: {error:#}"),
             }
         }
@@ -408,10 +577,15 @@ pub mod panel {
                 Err(error) => self.status = format!("Stop failed: {error:#}"),
             }
         }
-    }
-
-    impl eframe::App for Panel {
-        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        /// Draw and poll the panel, also usable without a native window.
+        pub fn show(&mut self, ctx: &egui::Context) {
+            let running = match self.player.is_running() {
+                Ok(running) => running,
+                Err(error) => {
+                    self.status = format!("Player monitoring failed: {error:#}");
+                    false
+                }
+            };
             for file in ctx.input(|input| input.raw.dropped_files.clone()) {
                 if let Some(path) = file.path {
                     self.media_path = path.to_string_lossy().into_owned();
@@ -421,6 +595,9 @@ pub mod panel {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("wallbreak");
                 ui.label("Drop a media file here, or type its path.");
+                if crate::gnome::is_current() {
+                    ui.label("GNOME: video/scene animation requires the optional GNOME 50 Shell bridge. Installation/activation are never automatic. Static images need no extension.");
+                }
                 ui.horizontal(|ui| {
                     ui.label("Steam:");
                     let selected = self
@@ -481,7 +658,7 @@ pub mod panel {
                 );
                 ui.horizontal(|ui| {
                     ui.label("Output:");
-                    egui::ComboBox::from_id_source("output")
+                        egui::ComboBox::from_id_source("output")
                         .selected_text(if self.output.is_empty() {
                             "default".to_string()
                         } else {
@@ -512,20 +689,45 @@ pub mod panel {
                     if ui.button("Preview").clicked() {
                         self.preview(ctx);
                     }
-                    if self.player.is_running() {
+                    if self.player.has_pending_work() {
                         if ui.button("Stop").clicked() {
                             self.stop();
                         }
-                        ui.label(format!("Running: {}", self.player.description()));
+                        ui.label(format!(
+                            "{}: {}",
+                            if running {
+                                "Process running"
+                            } else {
+                                "Cleanup pending"
+                            },
+                            self.player.description()
+                        ));
                     } else if ui.button("Play").clicked() {
                         self.play();
                     }
                 });
+                ui.separator();
+                ui.label(&self.status);
+                if let Some(status) = self.player.exit_status() {
+                    let message = format!("Player exited: {status}");
+                    if status.success() {
+                        ui.label(message);
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_RED, message);
+                    }
+                }
+                let diagnostics = self.player.diagnostics();
+                if !diagnostics.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .id_source("player-diagnostics")
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.monospace(diagnostics);
+                        });
+                }
                 if let Some(texture) = &self.preview_texture {
                     ui.image(texture);
                 }
-                ui.separator();
-                ui.label(&self.status);
                 if !self.inspect_json.is_empty() {
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
@@ -534,6 +736,15 @@ pub mod panel {
                         });
                 }
             });
+            if self.player.has_pending_work() {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+
+    impl eframe::App for Panel {
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            self.show(ctx);
         }
     }
 }

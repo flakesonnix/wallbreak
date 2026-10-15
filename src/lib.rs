@@ -1,7 +1,11 @@
 pub mod display;
+pub mod gnome;
+pub mod gnome_bridge;
 pub mod gui;
 pub mod media;
 pub mod project;
+#[cfg(feature = "gui")]
+pub mod renderer;
 pub mod scene;
 pub mod steam;
 pub mod texture;

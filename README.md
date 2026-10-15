@@ -2,6 +2,9 @@
 
 An independent, experimental Rust image/video and one-scene wallpaper player
 for Linux Wayland compositors implementing `wlr-layer-shell`, tested with Sway.
+GNOME has a separate, static-image-only backend using `gsettings`. GNOME does
+not support animated videos or scenes through wallbreak; these requests fail
+with an explicit diagnostic rather than opening an ordinary window.
 It is not a full Wallpaper Engine clone. No Steam,
 Wine, or Wallpaper Engine executable is launched.
 
@@ -52,6 +55,23 @@ process owns one output. `--fit contain` adds black bars instead of cropping.
 Ctrl-C or SIGTERM removes the player's background surface and stops/reaps its
 decoder. `--duration-seconds 15` limits a trial run. No startup service or desktop
 configuration is installed, and existing wallpaper processes are not stopped.
+
+On GNOME, use a direct image or select **Use project preview** explicitly for a
+static project image. Leave output selection unset: GNOME applies its image to
+all displays. The backend updates both light/dark image URIs and the picture
+mode, then restores its prior values on Stop, normal GUI close, SIGINT/SIGTERM,
+or a duration deadline. Settings changed by you or another app during playback
+are retained. A per-user runtime lock rejects simultaneous GNOME players.
+Forced termination (SIGKILL), power loss, and external settings-service failures
+can prevent restoration; those cases are not a persistent configuration service.
+
+```bash
+nix run .#cli -- play /absolute/path/to/image.jpg --duration-seconds 15
+```
+
+GUI playback errors, including missing layer-shell, unsupported GNOME animation,
+and decoder errors, remain visible in the panel. Stop requests graceful cleanup
+before escalation; a forced kill is reported and cannot guarantee restoration.
 
 Image formats: JPEG, PNG, WebP, BMP, GIF. Only a single static frame is decoded;
 animated images and EXIF rotation are not implemented. Video input suffixes:
@@ -142,6 +162,7 @@ included here. Local ownership does not establish redistribution rights.
 cargo test --locked
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --features gui
 nix flake check .
 ```
 
@@ -159,6 +180,10 @@ export WALLPAPER_TEST_SWAY="$(command -v sway)"
 export WALLPAPER_TEST_SWAYMSG="$(command -v swaymsg)"
 export WALLPAPER_TEST_GRIM="$(command -v grim)"
 cargo test --locked --test headless -- --ignored --nocapture
+
+# Real gsettings round trips in a temporary keyfile backend, not your desktop:
+export WALLBREAK_TEST_GSETTINGS="$(command -v gsettings)"
+cargo test --locked --features gui --test gnome -- --ignored
 ```
 
 The local scene tests require an explicitly selected Eagle Flag project and do
@@ -169,7 +194,7 @@ configuration. It checks output discovery, actual image pixels, changing video
 pixels, resize, scale, automatic stop, SIGTERM, surface removal, and, when a
 scene root is supplied, changing animated-scene pixels. It never connects to
 the existing desktop's socket. It generates its own image/video media; no
-commercial fixture is required. X11, GNOME, other scene shaders, JavaScript
+commercial fixture is required. X11, GNOME animation, other scene shaders, JavaScript
 scenes, packed `scene.pkg` content, interactive wallpapers, and full Wallpaper
 Engine compatibility remain unsupported.
 

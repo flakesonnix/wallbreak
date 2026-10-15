@@ -1,0 +1,24 @@
+<node>
+  <interface name="io.github.flakesonnix.Wallbreak1">
+    <method name="Info">
+      <arg name="protocol" type="u" direction="out"/>
+    </method>
+    <method name="Start">
+      <arg name="renderer" type="s" direction="in"/>
+      <arg name="source" type="s" direction="in"/>
+      <arg name="fps" type="u" direction="in"/>
+      <arg name="fit" type="s" direction="in"/>
+      <arg name="ffmpeg" type="s" direction="in"/>
+      <arg name="output" type="s" direction="in"/>
+      <arg name="session" type="s" direction="out"/>
+    </method>
+    <method name="Status">
+      <arg name="session" type="s" direction="in"/>
+      <arg name="state" type="s" direction="out"/>
+      <arg name="detail" type="s" direction="out"/>
+    </method>
+    <method name="Stop">
+      <arg name="session" type="s" direction="in"/>
+    </method>
+  </interface>
+</node>

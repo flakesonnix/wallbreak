@@ -54,6 +54,7 @@ impl Session {
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("WAYLAND_DISPLAY", &self.display)
             .env("SWAYSOCK", &self.ipc)
+            .env("XDG_CURRENT_DESKTOP", "sway")
             .env_remove("WAYLAND_SOCKET")
             .env_remove("DISPLAY");
         command

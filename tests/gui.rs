@@ -47,18 +47,8 @@ fn non_black_pixels(image: &image::RgbaImage) -> usize {
 }
 
 #[test]
-#[ignore = "requires explicit WALLPAPER_TEST_SWAY, SWAYMSG, GRIM binaries and GUI runtime libraries; creates only an isolated compositor"]
+#[ignore = "requires explicit WALLPAPER_TEST_SWAY and WALLPAPER_TEST_GRIM binaries and GUI runtime libraries; creates only an isolated compositor"]
 fn panel_maps_a_visible_window_in_isolated_sway() {
-    for name in [
-        "WALLPAPER_TEST_SWAY",
-        "WALLPAPER_TEST_SWAYMSG",
-        "WALLPAPER_TEST_GRIM",
-    ] {
-        if std::env::var_os(name).is_none() {
-            eprintln!("skipping GUI check without {name}");
-            return;
-        }
-    }
     let binary = |name: &str| {
         std::env::var_os(name).unwrap_or_else(|| panic!("set {name} to an existing binary"))
     };
