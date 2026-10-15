@@ -18,7 +18,7 @@ use wallpaper_rs::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Image/video wallpapers for Wayland layer-shell; no scene or web rendering"
+    about = "Image/video wallpapers plus one exact animated flag scene for Wayland layer-shell"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Resolve direct media or an unencrypted Wallpaper Engine video project without playing it.
+    /// Resolve direct media, a video project, or one exact animated flag scene without playing it.
     Inspect {
         path: PathBuf,
         #[arg(long)]
@@ -38,7 +38,7 @@ enum Action {
     /// Show an input-transparent background on one output until Ctrl-C.
     Play {
         path: PathBuf,
-        /// Select the project's static preview instead of claiming scene/web support.
+        /// Select the project's static preview instead of rendering its scene or web content.
         #[arg(long)]
         preview: bool,
         /// Exact compositor output name; defaults to the first advertised output.
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
         } => {
             let media = project::resolve(&path, preview)?;
             ensure!(
-                frames == 1 || media.kind == project::MediaKind::Video,
+                frames == 1 || !matches!(media.kind, project::MediaKind::Image),
                 "static images provide exactly one frame"
             );
             let options = PlaybackOptions {

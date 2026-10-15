@@ -14,7 +14,10 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::ValueEnum;
 use image::{imageops, ImageReader, RgbaImage};
 
-use crate::project::{Media, MediaKind};
+use crate::{
+    project::{Media, MediaKind},
+    scene::SceneFrame,
+};
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -56,6 +59,7 @@ pub struct MediaWorker {
     stop: Arc<AtomicBool>,
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
+    scene: Option<SceneFrame>,
 }
 
 impl MediaWorker {
@@ -72,6 +76,20 @@ impl MediaWorker {
         );
         let latest = Arc::new(Mutex::new(Latest::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        if media.kind == MediaKind::Scene {
+            let scene = media
+                .scene
+                .clone()
+                .context("scene selection is missing its validated renderer")?;
+            let frame = scene.start_frame(width, height, options.fit)?;
+            return Ok(Self {
+                latest,
+                stop,
+                child: None,
+                reader: None,
+                scene: Some(frame),
+            });
+        }
         if media.kind == MediaKind::Image {
             let mut input = ImageReader::open(&media.path)
                 .context("cannot open image")?
@@ -92,6 +110,7 @@ impl MediaWorker {
                 stop,
                 child: None,
                 reader: None,
+                scene: None,
             });
         }
 
@@ -143,6 +162,7 @@ impl MediaWorker {
             stop,
             child: Some(child),
             reader: None,
+            scene: None,
         };
         let mut stdout = worker
             .child
@@ -170,6 +190,9 @@ impl MediaWorker {
     }
 
     pub fn take_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        if let Some(frame) = &self.scene {
+            return Ok(Some(frame.render_frame(frame.elapsed())?));
+        }
         let mut latest = self
             .latest
             .lock()
@@ -200,6 +223,7 @@ impl MediaWorker {
                 .join()
                 .map_err(|_| anyhow::anyhow!("video reader panicked"))?;
         }
+        self.scene = None;
         Ok(())
     }
 }
@@ -338,8 +362,10 @@ mod tests {
     #[test]
     #[ignore = "requires WALLPAPER_TEST_FFMPEG pointing to a real FFmpeg binary"]
     fn video_decoding_and_cleanup_with_real_ffmpeg_when_explicitly_selected() {
-        let ffmpeg = std::env::var_os("WALLPAPER_TEST_FFMPEG")
-            .expect("set WALLPAPER_TEST_FFMPEG to a real FFmpeg binary");
+        let Some(ffmpeg) = std::env::var_os("WALLPAPER_TEST_FFMPEG") else {
+            eprintln!("skipping FFmpeg check without WALLPAPER_TEST_FFMPEG");
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.mkv");
         let status = Command::new(&ffmpeg)

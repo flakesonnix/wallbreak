@@ -33,8 +33,13 @@ fn decodes_real_image_without_wayland_or_ffmpeg() {
 #[test]
 fn scene_project_requires_explicit_preview_and_preserves_source() {
     let directory = tempfile::tempdir().unwrap();
-    let source = r#"{"file":"scene.json","preview":"preview.png","type":"scene"}"#;
+    let source = r#"{"file":"scene.json","preview":"preview.png","type":"scene","general":{"properties":{"schemecolor":{"type":"color","value":"0 0 0"},"flagcolor1":{"type":"color","value":"1 1 1"},"flagcolor2":{"type":"color","value":"1 0 0"}}}}"#;
     fs::write(directory.path().join("project.json"), source).unwrap();
+    fs::write(
+        directory.path().join("scene.json"),
+        r#"{"camera":{"center":"0 0 -1","eye":"0 0 0","up":"0 1 0"},"general":{"bloom":true,"clearcolor":"0 0 0","orthogonalprojection":{"width":2,"height":2}},"objects":[{"angles":"0 0 0","id":1,"image":"models/a.json","name":"a","origin":"1 1 0","scale":"1 1 1"}]}"#,
+    )
+    .unwrap();
     RgbaImage::new(2, 2)
         .save(directory.path().join("preview.png"))
         .unwrap();

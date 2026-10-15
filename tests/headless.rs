@@ -78,6 +78,17 @@ impl Session {
 #[test]
 #[ignore = "requires explicit WALLPAPER_TEST_SWAY, SWAYMSG, GRIM and FFMPEG binaries; creates only an isolated compositor"]
 fn presents_image_and_video_resizes_and_stops_in_isolated_sway() {
+    for name in [
+        "WALLPAPER_TEST_SWAY",
+        "WALLPAPER_TEST_SWAYMSG",
+        "WALLPAPER_TEST_GRIM",
+        "WALLPAPER_TEST_FFMPEG",
+    ] {
+        if std::env::var_os(name).is_none() {
+            eprintln!("skipping headless check without {name}");
+            return;
+        }
+    }
     let required =
         |name| std::env::var_os(name).unwrap_or_else(|| panic!("set {name} to an existing binary"));
     let sway = required("WALLPAPER_TEST_SWAY");
@@ -265,5 +276,58 @@ fn presents_image_and_video_resizes_and_stops_in_isolated_sway() {
         cleared.pixels().all(|pixel| pixel.0[..3] == [0, 0, 0]),
         "wallpaper surface was not removed after stop"
     );
+    if let Some(scene) = std::env::var_os("WALLPAPER_TEST_SCENE_ROOT") {
+        let changed = session
+            .command(&swaymsg)
+            .arg("output HEADLESS-1 scale 1")
+            .output()
+            .unwrap();
+        assert!(
+            changed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&changed.stderr)
+        );
+        thread::sleep(Duration::from_millis(300));
+        let mut scene_player = OwnedChild(
+            session
+                .command(BINARY)
+                .arg("play")
+                .arg(&scene)
+                .args([
+                    "--output",
+                    "HEADLESS-1",
+                    "--fps",
+                    "1",
+                    "--duration-seconds",
+                    "10",
+                ])
+                .spawn()
+                .unwrap(),
+        );
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            scene_player.0.try_wait().unwrap().is_none(),
+            "scene player exited early"
+        );
+        let first = session.screenshot(&screenshot);
+        thread::sleep(Duration::from_millis(3000));
+        let second = session.screenshot(&screenshot);
+        assert_eq!(second.dimensions(), (480, 270));
+        assert_ne!(
+            first.as_raw(),
+            second.as_raw(),
+            "scene pixels did not change"
+        );
+        assert!(
+            second.pixels().any(|pixel| pixel.0[..3] != [0, 0, 0]),
+            "scene did not present visible pixels"
+        );
+        scene_player.wait(Duration::from_secs(16));
+        let cleared = session.screenshot(&screenshot);
+        assert!(
+            cleared.pixels().all(|pixel| pixel.0[..3] == [0, 0, 0]),
+            "scene surface was not removed after stop"
+        );
+    }
     eprintln!("verified: outputs, image pixels, changing video, resize, scale, duration, SIGTERM and unmap in isolated Sway");
 }

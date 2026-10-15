@@ -1,5 +1,5 @@
 {
-  description = "Experimental Rust image/video wallpaper player for Wayland";
+  description = "Experimental Rust image/video and one-scene wallpaper player for Wayland";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/e11136d15d537efb924780f4bacbabd3340aac28";
 
   outputs = { nixpkgs, ... }:
@@ -23,7 +23,8 @@
         checkPhase = ''
           runHook preCheck
           export WALLPAPER_TEST_FFMPEG=${pkgs.lib.getExe pkgs.ffmpeg}
-          cargo test --offline --locked --release --lib --bins --test cli -- --include-ignored
+          cargo test --offline --locked --release --lib --bins --test cli --test scene -- --include-ignored
+          cargo test --offline --locked --release --test headless
           runHook postCheck
         '';
         postInstall = ''
@@ -31,7 +32,7 @@
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}
         '';
         meta = {
-          description = "Experimental Wayland image/video wallpaper player; not a scene renderer";
+          description = "Experimental Wayland image/video wallpaper player with one supported animated scene";
           license = pkgs.lib.licenses.mit;
           platforms = [ system ];
           mainProgram = "wallpaper-rs";

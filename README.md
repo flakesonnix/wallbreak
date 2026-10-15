@@ -1,14 +1,15 @@
 # wallpaper-rs
 
-An independent, experimental Rust image/video wallpaper player for Linux
-Wayland compositors implementing `wlr-layer-shell`, tested with Sway. It is not
-a full Wallpaper Engine clone or a REA analysis provider. No Steam, Wine, or
-Wallpaper Engine executable is launched.
+An independent, experimental Rust image/video and one-scene wallpaper player
+for Linux Wayland compositors implementing `wlr-layer-shell`, tested with Sway.
+It is not a full Wallpaper Engine clone or a REA analysis provider. No Steam,
+Wine, or Wallpaper Engine executable is launched.
 
 Rust owns project selection, image decoding, bounded frame delivery, shared-memory
 presentation, output selection, and decoder cleanup. Videos use an external
-FFmpeg process, not a Rust video codec implementation. The Nix package supplies
-FFmpeg without changing the system configuration.
+FFmpeg process, not a Rust video codec implementation. The supported animated
+scene uses an independent CPU renderer and native project textures. The Nix
+package supplies FFmpeg without changing the system configuration.
 
 ## Use
 
@@ -48,14 +49,21 @@ cargo build --locked --release
 ## Wallpaper Engine Projects
 
 `inspect`, `check`, and `play` accept a project directory or `project.json` with
-an explicit `type: "video"` and a project-relative `file`. The selected media
-must resolve inside that project, including through symlinks. Unknown types,
-malformed JSON, parent traversal, and missing media fail rather than silently
-choosing another file. Backslash-separated project paths are not supported.
+an explicit `type: "video"` or one supported `type: "scene"` profile, plus a
+project-relative `file`. The selected media must resolve inside that project,
+including through symlinks. Unknown types, malformed JSON, parent traversal,
+missing media, and unsupported scene features fail rather than silently
+choosing another file or preview. Backslash-separated project paths are not
+supported.
 
-Scene, web, and application wallpapers are not supported. They do not become
-image or video wallpapers because a preview exists. Explicit `--preview` selects
-only the declared static preview and reports `preview_only: true`:
+Only this scene profile is supported: one zero-rotation image quad, one
+`flag`-shader pass with `TINT=1`, three native `.tex` textures, disabled depth
+testing/writing, and the project's three declared tint colors. It renders the
+project's animated flag material from native textures. Web, application, packed
+`scene.pkg`, multi-object, rotated, scripted, particle, 3D, perspective, bloom,
+and other shader/material projects remain unsupported. For those projects,
+explicit `--preview` selects only the declared static preview and reports
+`preview_only: true`:
 
 ```bash
 project="$HOME/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach"
@@ -82,6 +90,19 @@ The input contract was investigated from the locally installed Wallpaper Engine
   declare web content, and three omit a type. No video project/media was found
   within that default collection. The video-project importer is therefore tested
   with synthetic projects, not claimed verified against a shipped video project.
+- `projects/defaultprojects/eagleflag/project.json`: `type: "scene"`,
+  `file: "scene.json"`, with project colors for scheme and two accents.
+- `projects/defaultprojects/eagleflag/scene.json`: a 2200×1080 orthographic
+  scene containing one zero-rotation `eagle` image object at
+  `1082.000 550.906 0.000`, scaled by `1.100 1.100 1.000`.
+- `projects/defaultprojects/eagleflag/models/eagle.json`: a 2048×1024 model
+  using `materials/eagle.json`.
+- `projects/defaultprojects/eagleflag/materials/eagle.json`: one `flag` pass
+  with `TINT=1`, `Speed≈0.4`, `Strength≈0.3`, and textures
+  `eagle`, `flag_normal`, and `cloth`.
+- The three corresponding native `.tex` files use `TEXV0005`, `TEXI0001`, and
+  `TEXB0003` with DXT5 payloads; their decoded dimensions match the shipped
+  2048×1024, 32×32, and 512×512 images.
 
 Earlier REA static analysis covered `distribution/wallpaper64.exe` resource
 metadata and the selected `ui/dist/scripts/scripts.js` bundle. That does not
@@ -107,7 +128,8 @@ ordinary unit and public CLI tests. For the explicit real-provider lanes:
 ```bash
 nix develop path:.
 export WALLPAPER_TEST_FFMPEG="$(command -v ffmpeg)"
-cargo test --locked --lib --bins --test cli -- --include-ignored
+export WALLPAPER_TEST_SCENE_ROOT=/absolute/path/to/eagleflag
+cargo test --locked --lib --bins --test cli --test scene -- --include-ignored
 
 export WALLPAPER_TEST_SWAY="$(command -v sway)"
 export WALLPAPER_TEST_SWAYMSG="$(command -v swaymsg)"
@@ -115,19 +137,26 @@ export WALLPAPER_TEST_GRIM="$(command -v grim)"
 cargo test --locked --test headless -- --ignored --nocapture
 ```
 
-The headless test starts a separate software-rendered Sway instance with its own
-runtime directory and configuration. It checks output discovery, actual image
-pixels, changing video pixels, resize, scale, automatic stop, SIGTERM, and surface
-removal. It never connects to the existing desktop's socket. It generates its
-own media; no commercial fixture is required. X11, GNOME, scene shaders,
-JavaScript scenes, packed `scene.pkg` content, interactive wallpapers, and
-full Wallpaper Engine compatibility are outside this MVP.
+The local scene tests require an explicitly selected Eagle Flag project and do
+not bundle its textures. They check native texture decoding, profile resolution,
+animated rendering, and preview similarity. The headless test starts a separate
+software-rendered Sway instance with its own runtime directory and
+configuration. It checks output discovery, actual image pixels, changing video
+pixels, resize, scale, automatic stop, SIGTERM, surface removal, and, when a
+scene root is supplied, changing animated-scene pixels. It never connects to
+the existing desktop's socket. It generates its own image/video media; no
+commercial fixture is required. X11, GNOME, other scene shaders, JavaScript
+scenes, packed `scene.pkg` content, interactive wallpapers, and full Wallpaper
+Engine compatibility remain unsupported.
 
 Frames are admitted before allocation, with a 64 MiB physical-frame ceiling,
 at most three shared-memory presentation buffers, one pending presentation
 frame, and a latest-frame-only decoder slot. The reader can hold one additional
 frame while decoding. Image decoding has an independent 64 MiB allocation
-budget. FFmpeg has a 64 MiB per-allocation limit and two decoder threads, not a
-process-wide memory cap. It may access local files but network protocols are
-disabled. This is not a sandbox for untrusted media; decoder internals, total
-CPU/memory usage, and 4K/60-fps performance are not bounded or benchmarked here.
+budget. Native scene textures have a separate 64 MiB decoded budget. The scene
+renderer may use up to eight threads; high-resolution scenes can therefore use
+substantial sustained CPU. FFmpeg has a 64 MiB per-allocation limit and two
+decoder threads, not a process-wide memory cap. It may access local files but
+network protocols are disabled. This is not a sandbox for untrusted media;
+decoder internals, total CPU/memory usage, and 4K/60-fps performance are not
+bounded or benchmarked here.

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
@@ -7,6 +8,8 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::scene::{self, Scene, SceneProfile};
+
 const MAX_PROJECT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -14,6 +17,7 @@ const MAX_PROJECT_BYTES: u64 = 1024 * 1024;
 pub enum MediaKind {
     Image,
     Video,
+    Scene,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +27,9 @@ pub struct Media {
     pub project_path: Option<PathBuf>,
     pub declared_file: Option<String>,
     pub preview_only: bool,
+    #[serde(skip_serializing)]
+    pub scene: Option<Scene>,
+    pub scene_profile: Option<SceneProfile>,
     pub limitations: Vec<String>,
 }
 
@@ -32,6 +39,12 @@ struct Project {
     kind: Option<String>,
     file: Option<String>,
     preview: Option<String>,
+    general: Option<ProjectGeneral>,
+}
+
+#[derive(Deserialize)]
+struct ProjectGeneral {
+    properties: HashMap<String, serde_json::Value>,
 }
 
 pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
@@ -68,9 +81,11 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
             .context("project has no preview declaration")?
     } else {
         match project.kind.as_deref() {
-            Some("video") => project.file.context("video project has no file declaration")?,
+            Some("video") | Some("scene") => {
+                project.file.context("project has no file declaration")?
+            }
             Some(kind) => bail!(
-                "project type {kind:?} is unsupported: this MVP plays images/videos, not scenes, web pages or executables; use --preview explicitly for its static preview"
+                "project type {kind:?} is unsupported: this MVP plays images/videos and one exact flag scene, not web pages or executables; use --preview explicitly for its static preview"
             ),
             None => bail!("project type is unknown; use an explicit media file or --preview"),
         }
@@ -79,6 +94,25 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
         .parent()
         .context("project has no parent directory")?;
     let selected = project_file(root, &declared_file)?;
+    if !preview && project.kind.as_deref() == Some("scene") {
+        let properties = project
+            .general
+            .context("scene project has no general properties")?;
+        let colors = scene::parse_project_colors(&properties.properties)?;
+        let scene = scene::load(&selected, root, &colors)?;
+        let profile = scene.profile().clone();
+        let limitations = profile.limitations.clone();
+        return Ok(Media {
+            path: selected,
+            kind: MediaKind::Scene,
+            project_path: Some(project_path),
+            declared_file: Some(declared_file),
+            preview_only: false,
+            scene: Some(scene),
+            scene_profile: Some(profile),
+            limitations,
+        });
+    }
     let resolved = media(selected, Some(project_path), Some(declared_file), preview)?;
     if preview {
         ensure!(
@@ -150,6 +184,8 @@ fn media(
         project_path,
         declared_file,
         preview_only: preview,
+        scene: None,
+        scene_profile: None,
         limitations,
     })
 }
@@ -178,13 +214,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         project(
             dir.path(),
-            r#"{"file":"scene.json","preview":"preview.jpg","type":"scene"}"#,
+            r#"{"file":"scene.json","preview":"preview.jpg","type":"scene","general":{"properties":{"schemecolor":{"type":"color","value":"0 0 0"},"flagcolor1":{"type":"color","value":"1 1 1"},"flagcolor2":{"type":"color","value":"1 0 0"}}}}"#,
         );
+        fs::write(
+            dir.path().join("scene.json"),
+            r#"{"camera":{"center":"0 0 -1","eye":"0 0 0","up":"0 1 0"},"general":{"bloom":false,"clearcolor":"0 0 0","orthogonalprojection":{"width":2,"height":2}},"objects":[{"angles":"0 0 0","id":1,"image":"models/a.json","name":"a","origin":"1 1 0","scale":"1 1 1"},{"angles":"0 0 0","id":2,"image":"models/b.json","name":"b","origin":"1 1 0","scale":"1 1 1"}]}"#,
+        )
+        .unwrap();
         fs::write(dir.path().join("preview.jpg"), b"preview").unwrap();
         assert!(resolve(dir.path(), false)
             .unwrap_err()
             .to_string()
-            .contains("unsupported"));
+            .contains("only one zero-rotation"));
         let selected = resolve(dir.path(), true).unwrap();
         assert!(selected.preview_only);
         assert_eq!(selected.declared_file.as_deref(), Some("preview.jpg"));

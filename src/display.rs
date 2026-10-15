@@ -128,7 +128,7 @@ pub fn run(
         pending_frame: None,
         received_frame: false,
         callback_pending: false,
-        video: matches!(media.kind, MediaKind::Video),
+        video: matches!(media.kind, MediaKind::Video | MediaKind::Scene),
         poll_interval: (Duration::from_secs(1) / options.fps)
             .clamp(Duration::from_millis(1), STOP_POLL_INTERVAL),
         next_poll: Instant::now(),
