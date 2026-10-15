@@ -30,7 +30,10 @@
         '';
         postInstall = ''
           wrapProgram "$out/bin/wallbreak" \
-            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]} \
+            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [
+              pkgs.wayland
+            ]}
           wrapProgram "$out/bin/wallbreak-gui" \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]} \
             --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [
