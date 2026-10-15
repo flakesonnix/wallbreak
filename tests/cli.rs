@@ -2,7 +2,7 @@ use std::{fs, process::Command};
 
 use image::{Rgba, RgbaImage};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_wallpaper-rs");
+const BINARY: &str = env!("CARGO_BIN_EXE_wallbreak");
 
 #[test]
 fn decodes_real_image_without_wayland_or_ffmpeg() {

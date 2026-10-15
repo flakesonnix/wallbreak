@@ -1,9 +1,9 @@
 [package]
-name = "wallpaper-rs"
+name = "wallbreak"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Experimental image and video wallpaper player for Wayland layer-shell compositors"
+description = "Experimental image/video and one-scene wallpaper player for Wayland layer-shell compositors"
 license = "MIT"
 publish = false
 

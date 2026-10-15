@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
-use wallpaper_rs::{
+use wallbreak::{
     display,
     media::{Fit, MediaWorker, PlaybackOptions},
     project,

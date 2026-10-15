@@ -6,8 +6,8 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      wallpaper = pkgs.rustPlatform.buildRustPackage {
-        pname = "wallpaper-rs";
+      wallbreak = pkgs.rustPlatform.buildRustPackage {
+        pname = "wallbreak";
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./.;
@@ -28,25 +28,25 @@
           runHook postCheck
         '';
         postInstall = ''
-          wrapProgram "$out/bin/wallpaper-rs" \
+          wrapProgram "$out/bin/wallbreak" \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}
         '';
         meta = {
           description = "Experimental Wayland image/video wallpaper player with one supported animated scene";
           license = pkgs.lib.licenses.mit;
           platforms = [ system ];
-          mainProgram = "wallpaper-rs";
+          mainProgram = "wallbreak";
         };
       };
     in
     {
-      packages.${system}.default = wallpaper;
+      packages.${system}.default = wallbreak;
       apps.${system}.default = {
         type = "app";
-        program = "${wallpaper}/bin/wallpaper-rs";
-        meta.description = wallpaper.meta.description;
+        program = "${wallbreak}/bin/wallbreak";
+        meta.description = wallbreak.meta.description;
       };
-      checks.${system}.default = wallpaper;
+      checks.${system}.default = wallbreak;
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [ cargo rustc rustfmt clippy ffmpeg sway grim ];
       };

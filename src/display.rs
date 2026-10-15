@@ -193,7 +193,7 @@ pub fn run(
             &qh,
             surface,
             Layer::Background,
-            Some("wallpaper-rs"),
+            Some("wallbreak"),
             Some(&outputs[index]),
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);

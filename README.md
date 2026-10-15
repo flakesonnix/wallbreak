@@ -1,4 +1,4 @@
-# wallpaper-rs
+# wallbreak
 
 An independent, experimental Rust image/video and one-scene wallpaper player
 for Linux Wayland compositors implementing `wlr-layer-shell`, tested with Sway.
@@ -42,8 +42,8 @@ Without Nix, use Rust 1.88+ and FFmpeg:
 
 ```bash
 cargo build --locked --release
-./target/release/wallpaper-rs outputs
-./target/release/wallpaper-rs play /absolute/path/to/video.mp4 --ffmpeg /absolute/path/to/ffmpeg
+./target/release/wallbreak outputs
+./target/release/wallbreak play /absolute/path/to/video.mp4 --ffmpeg /absolute/path/to/ffmpeg
 ```
 
 ## Wallpaper Engine Projects

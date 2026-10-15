@@ -13,7 +13,7 @@ use std::{
 use image::{Rgba, RgbaImage};
 use rustix::process::{kill_process, Pid, Signal};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_wallpaper-rs");
+const BINARY: &str = env!("CARGO_BIN_EXE_wallbreak");
 
 struct OwnedChild(Child);
 

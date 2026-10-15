@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use wallpaper_rs::{
+use wallbreak::{
     media::Fit,
     project::{self, MediaKind},
 };
