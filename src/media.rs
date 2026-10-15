@@ -21,7 +21,7 @@ use crate::{
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Fit {
     Cover,
     Contain,

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use wallbreak::{
     display,
     media::{Fit, MediaWorker, PlaybackOptions},
-    project,
+    project, steam,
 };
 
 #[derive(Parser)]
@@ -35,6 +35,8 @@ enum Action {
     },
     /// List the current compositor's advertised output names without changing wallpapers.
     Outputs,
+    /// List installed Wallpaper Engine projects from local Steam libraries.
+    Projects,
     /// Show an input-transparent background on one output until Ctrl-C.
     Play {
         path: PathBuf,
@@ -84,7 +86,11 @@ fn main() -> Result<()> {
         }
         Action::Outputs => println!(
             "{}",
-            serde_json::to_string_pretty(&display::list_outputs()?)?
+            serde_json::to_string_pretty(&display::list_outputs()?)?,
+        ),
+        Action::Projects => println!(
+            "{}",
+            serde_json::to_string_pretty(&steam::scan(&steam::default_roots()))?,
         ),
         Action::Play {
             path,

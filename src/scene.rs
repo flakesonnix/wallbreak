@@ -167,6 +167,13 @@ struct PassDocument {
     usershadervalues: HashMap<String, String>,
 }
 
+/// Validated scene metadata without decoded textures.
+#[derive(Debug, Clone)]
+pub struct SceneSpec {
+    pub profile: SceneProfile,
+    pub texture_paths: [PathBuf; 3],
+}
+
 /// Load and validate one exact scene project selection.
 ///
 /// `properties` are the project's declared color values. The scene file itself
@@ -176,6 +183,40 @@ pub fn load(
     project_root: &Path,
     properties: &HashMap<String, [f32; 3]>,
 ) -> Result<Scene> {
+    let spec = parse(scene_path, project_root, properties)?;
+    let mut textures = Vec::with_capacity(3);
+    let mut rgba_total = 0usize;
+    for path in &spec.texture_paths {
+        let texture = load_texture(path)
+            .with_context(|| format!("invalid native texture {}", path.display()))?;
+        rgba_total = rgba_total
+            .checked_add(texture.rgba.len())
+            .context("scene texture total overflow")?;
+        ensure!(
+            rgba_total <= MAX_TEXTURE_RGBA_TOTAL,
+            "scene textures exceed 64 MiB decoded budget"
+        );
+        textures.push(texture);
+    }
+    let [base, normal, cloth] = textures
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("flag material must declare exactly three textures"))?;
+    Ok(Scene {
+        profile: spec.profile,
+        base,
+        normal,
+        cloth,
+    })
+}
+
+/// Validate one exact scene project selection without decoding textures.
+///
+/// Used to mark Steam projects as supported before the user selects one.
+pub fn parse(
+    scene_path: &Path,
+    project_root: &Path,
+    properties: &HashMap<String, [f32; 3]>,
+) -> Result<SceneSpec> {
     let document: SceneDocument =
         read_json(scene_path, MAX_SCENE_BYTES).context("invalid scene.json")?;
     ensure!(
@@ -292,22 +333,15 @@ pub fn load(
     };
 
     let material_root = material_path.parent().context("material has no parent")?;
-    let mut textures = Vec::with_capacity(3);
-    let mut rgba_total = 0usize;
+    let mut texture_paths = Vec::with_capacity(3);
     for stem in &pass.textures {
-        let path = scene_relative(material_root, project_root, &format!("{stem}.tex"))?;
-        let texture =
-            load_texture(&path).with_context(|| format!("invalid native texture {stem}.tex"))?;
-        rgba_total = rgba_total
-            .checked_add(texture.rgba.len())
-            .context("scene texture total overflow")?;
-        ensure!(
-            rgba_total <= MAX_TEXTURE_RGBA_TOTAL,
-            "scene textures exceed 64 MiB decoded budget"
-        );
-        textures.push(texture);
+        texture_paths.push(scene_relative(
+            material_root,
+            project_root,
+            &format!("{stem}.tex"),
+        )?);
     }
-    let [base, normal, cloth] = textures
+    let texture_paths: [PathBuf; 3] = texture_paths
         .try_into()
         .map_err(|_| anyhow::anyhow!("flag material must declare exactly three textures"))?;
     let profile = SceneProfile {
@@ -339,11 +373,9 @@ pub fn load(
             "CPU reimplementation of the shipped flag vertex/fragment behavior; no engine code is executed.".into(),
         ],
     };
-    Ok(Scene {
+    Ok(SceneSpec {
         profile,
-        base,
-        normal,
-        cloth,
+        texture_paths,
     })
 }
 

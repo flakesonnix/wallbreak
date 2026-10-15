@@ -11,17 +11,39 @@ FFmpeg process, not a Rust video codec implementation. The supported animated
 scene uses an independent CPU renderer and native project textures. The Nix
 package supplies FFmpeg without changing the system configuration.
 
-## Use
+## Quick start
 
-From this directory:
+The easiest route is the control panel. From this directory:
 
 ```bash
-nix build .
-nix run . -- outputs
-nix run . -- inspect /absolute/path/to/image.jpg
-nix run . -- check /absolute/path/to/image.jpg
-nix run . -- play /absolute/path/to/image.jpg --output eDP-1
-nix run . -- play /absolute/path/to/video.mp4 --output eDP-1 --fps 30 --fit cover
+nix run .
+```
+
+Or without a checkout:
+
+```bash
+nix run github:flakesonnix/wallbreak
+```
+
+The panel lists your outputs, detects installed Wallpaper Engine projects from
+your local Steam libraries for one-click selection, accepts a dropped or typed
+media path, shows an in-process preview, and starts/stops the wallpaper on the
+selected output. To keep it permanently, install it into your profile:
+
+```bash
+nix profile install github:flakesonnix/wallbreak
+wallbreak-gui
+```
+
+For scripts and automation, the CLI stays available:
+
+```bash
+nix run .#cli -- outputs
+nix run .#cli -- projects
+nix run .#cli -- inspect /absolute/path/to/image.jpg
+nix run .#cli -- check /absolute/path/to/image.jpg
+nix run .#cli -- play /absolute/path/to/image.jpg --output eDP-1
+nix run .#cli -- play /absolute/path/to/video.mp4 --output eDP-1 --fps 30 --fit cover
 ```
 
 Use an exact output name returned by `outputs`. Without `--output`, the first
@@ -48,6 +70,8 @@ cargo build --locked --release
 
 ## Wallpaper Engine Projects
 
+`projects` lists every Wallpaper Engine project in your local Steam libraries
+with its support status, so you can pick one instead of typing paths.
 `inspect`, `check`, and `play` accept a project directory or `project.json` with
 an explicit `type: "video"` or one supported `type: "scene"` profile, plus a
 project-relative `file`. The selected media must resolve inside that project,
@@ -67,9 +91,9 @@ explicit `--preview` selects only the declared static preview and reports
 
 ```bash
 project="$HOME/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach"
-nix run . -- inspect "$project" --preview
-nix run . -- check "$project" --preview --width 640 --height 360
-nix run . -- play "$project" --preview --output eDP-1 --duration-seconds 15
+nix run .#cli -- inspect "$project" --preview
+nix run .#cli -- check "$project" --preview --width 640 --height 360
+nix run .#cli -- play "$project" --preview --output eDP-1 --duration-seconds 15
 ```
 
 The final command changes the chosen output temporarily. `inspect` only resolves
@@ -160,6 +184,20 @@ decoder threads, not a process-wide memory cap. It may access local files but
 network protocols are disabled. This is not a sandbox for untrusted media;
 decoder internals, total CPU/memory usage, and 4K/60-fps performance are not
 bounded or benchmarked here.
+
+## Releases
+
+Pushing a `v*` tag builds a release tarball with both binaries and attaches it
+to a GitHub release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+You can build the same tarball locally with `scripts/package-release.sh`. The
+tarball does not bundle FFmpeg or the GUI's OpenGL/Wayland runtime libraries;
+prefer the Nix flake for a complete installation.
 
 ## License
 
