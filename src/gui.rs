@@ -408,6 +408,8 @@ pub mod panel {
         pub preview_flag: bool,
         pub projects: Vec<ProjectEntry>,
         pub project: String,
+        pub thumbnails: std::collections::HashMap<String, egui::ColorImage>,
+        pub thumb_textures: std::collections::HashMap<String, egui::TextureHandle>,
         pub outputs: Vec<String>,
         pub output: String,
         pub fps: u32,
@@ -433,6 +435,8 @@ pub mod panel {
                 preview_flag: false,
                 projects: Vec::new(),
                 project: String::new(),
+                thumbnails: std::collections::HashMap::new(),
+                thumb_textures: std::collections::HashMap::new(),
                 outputs: Vec::new(),
                 output: String::new(),
                 fps: 30,
@@ -459,6 +463,30 @@ pub mod panel {
             if !self.projects.iter().any(|entry| entry.id == self.project) {
                 self.project.clear();
             }
+            // Bounded thumbnails for the gallery; failures keep text-only cards.
+            self.thumbnails.clear();
+            self.thumb_textures.clear();
+            for entry in &self.projects {
+                let Some(preview) = &entry.preview else {
+                    continue;
+                };
+                let Ok(image) = image::open(preview) else {
+                    continue;
+                };
+                let thumb = image.thumbnail(192, 192).into_rgba8();
+                let (width, height) = (thumb.width() as usize, thumb.height() as usize);
+                self.thumbnails.insert(
+                    entry.id.clone(),
+                    egui::ColorImage::from_rgba_unmultiplied([width, height], &thumb.into_raw()),
+                );
+            }
+        }
+
+        fn select_project(&mut self, entry: &ProjectEntry) {
+            self.project = entry.id.clone();
+            self.media_path = entry.path.to_string_lossy().into_owned();
+            self.preview_flag = false;
+            self.status = entry.support_note.clone();
         }
 
         pub fn refresh(&mut self) {
@@ -599,52 +627,87 @@ pub mod panel {
                     ui.label("GNOME: video/scene animation requires the optional GNOME 50 Shell bridge. Installation/activation are never automatic. Static images need no extension.");
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Steam:");
-                    let selected = self
-                        .projects
-                        .iter()
-                        .find(|entry| entry.id == self.project)
-                        .map(|entry| {
-                            format!(
-                                "{} [{}]{}",
-                                entry.title,
-                                entry.kind,
-                                if entry.supported {
-                                    ""
-                                } else {
-                                    " (unsupported)"
-                                }
-                            )
-                        })
-                        .unwrap_or_else(|| "none".to_string());
-                    egui::ComboBox::from_id_source("project")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
+                    ui.heading("Wallpapers");
+                    if ui.button("Rescan Steam").clicked() {
+                        self.refresh_projects();
+                    }
+                    if self.projects.is_empty() {
+                        ui.label("No Wallpaper Engine projects found.");
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .id_source("project-gallery")
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                             for entry in self.projects.clone() {
-                                let label = format!(
-                                    "{} [{}]{}",
-                                    entry.title,
-                                    entry.kind,
-                                    if entry.supported {
-                                        ""
+                                let selected = self.project == entry.id;
+                                let badge = if entry.supported { "✓" } else { "✗" };
+                                let mut clicked = false;
+                                egui::Frame::group(ui.style())
+                                    .fill(if selected {
+                                        ui.style().visuals.selection.bg_fill
                                     } else {
-                                        " (unsupported)"
-                                    }
-                                );
-                                if ui
-                                    .selectable_value(&mut self.project, entry.id.clone(), label)
-                                    .clicked()
-                                {
-                                    self.media_path = entry.path.to_string_lossy().into_owned();
-                                    self.preview_flag = false;
-                                    self.status = entry.support_note.clone();
+                                        ui.style().visuals.faint_bg_color
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_width(150.0);
+                                        if let Some(image) =
+                                            self.thumbnails.get(&entry.id).cloned()
+                                        {
+                                            let texture =
+                                                self.thumb_textures.entry(entry.id.clone()).or_insert_with(
+                                                    || {
+                                                        ctx.load_texture(
+                                                            format!(
+                                                                "wallbreak-project-{}",
+                                                                entry.id
+                                                            ),
+                                                            image,
+                                                            Default::default(),
+                                                        )
+                                                    },
+                                                );
+                                            let aspect = texture.size_vec2();
+                                            let height = 84.0f32.min(
+                                                150.0 * aspect.y / aspect.x.max(1.0),
+                                            );
+                                            if ui
+                                                .add(
+                                                    egui::ImageButton::new((
+                                                        texture.id(),
+                                                        egui::vec2(150.0, height),
+                                                    ))
+                                                    .selected(selected)
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                clicked = true;
+                                            }
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} {}",
+                                                badge, entry.title
+                                            ))
+                                            .small()
+                                            .strong(),
+                                        );
+                                        if ui
+                                            .small_button(&entry.kind)
+                                            .clicked()
+                                        {
+                                            clicked = true;
+                                        }
+                                    });
+                                if clicked {
+                                    self.select_project(&entry);
                                 }
                             }
                         });
-                    if ui.button("Rescan").clicked() {
-                        self.refresh_projects();
-                    }
-                });
+                    });
                 ui.horizontal(|ui| {
                     ui.label("Media:");
                     ui.text_edit_singleline(&mut self.media_path);
