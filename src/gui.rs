@@ -699,6 +699,58 @@ pub mod panel {
                 Err(error) => self.status = format!("Stop failed: {error:#}"),
             }
         }
+        /// Browse and playback controls, shared by the sidebar and the
+        /// collapsed narrow-window section.
+        fn browse_playback(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+            ui.heading("Browse");
+            ui.label("Search:");
+            ui.text_edit_singleline(&mut self.search);
+            ui.label("Type:");
+            egui::ComboBox::from_id_source("kind-filter")
+                .selected_text(&self.kind_filter)
+                .show_ui(ui, |ui| {
+                    for kind in ["All", "scene", "video", "web", "unknown"] {
+                        ui.selectable_value(&mut self.kind_filter, kind.to_string(), kind);
+                    }
+                });
+            ui.checkbox(&mut self.supported_only, "Supported only");
+            ui.separator();
+            ui.heading("Playback");
+            ui.label("Output:");
+            egui::ComboBox::from_id_source("output")
+                .selected_text(if self.output.is_empty() {
+                    "default".to_string()
+                } else {
+                    self.output.clone()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.output, String::new(), "default");
+                    for output in self.outputs.clone() {
+                        ui.selectable_value(&mut self.output, output.clone(), output);
+                    }
+                });
+            if ui.button("Refresh outputs").clicked() {
+                self.refresh();
+            }
+            ui.label("FPS:");
+            ui.add(egui::Slider::new(&mut self.fps, 1..=60));
+            ui.label("Fit:");
+            ui.radio_value(&mut self.fit, Fit::Cover, "cover");
+            ui.radio_value(&mut self.fit, Fit::Contain, "contain");
+            ui.label("FFmpeg:");
+            ui.text_edit_singleline(&mut self.ffmpeg);
+            if ui.button("Preview selection").clicked() {
+                self.preview(ctx);
+            }
+            if let Some(texture) = &self.preview_texture {
+                let size = texture.size_vec2();
+                let width = ui.available_width().min(320.0);
+                ui.image((
+                    texture.id(),
+                    egui::vec2(width, width * size.y / size.x.max(1.0)),
+                ));
+            }
+        }
         /// Draw and poll the panel, also usable without a native window.
         pub fn show(&mut self, ctx: &egui::Context) {
             let running = match self.player.is_running() {
@@ -715,7 +767,7 @@ pub mod panel {
                 }
             }
             egui::TopBottomPanel::top("wallbreak-top").show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.heading("wallbreak");
                     ui.label("Drop a media file anywhere, or pick a wallpaper below.");
                     if ui.button("Rescan Steam").clicked() {
@@ -740,61 +792,28 @@ pub mod panel {
                     ui.label("GNOME: video/scene animation requires the optional GNOME 50 Shell bridge. Static images need no extension.");
                 });
             }
-            egui::SidePanel::left("wallbreak-filters")
-                .resizable(true)
-                .default_width(210.0)
-                .show(ctx, |ui| {
-                    ui.heading("Browse");
-                    ui.label("Search:");
-                    ui.text_edit_singleline(&mut self.search);
-                    ui.label("Type:");
-                    egui::ComboBox::from_id_source("kind-filter")
-                        .selected_text(&self.kind_filter)
-                        .show_ui(ui, |ui| {
-                            for kind in ["All", "scene", "video", "web", "unknown"] {
-                                ui.selectable_value(&mut self.kind_filter, kind.to_string(), kind);
-                            }
-                        });
-                    ui.checkbox(&mut self.supported_only, "Supported only");
-                    ui.separator();
-                    ui.heading("Playback");
-                    ui.label("Output:");
-                    egui::ComboBox::from_id_source("output")
-                        .selected_text(if self.output.is_empty() {
-                            "default".to_string()
-                        } else {
-                            self.output.clone()
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.output, String::new(), "default");
-                            for output in self.outputs.clone() {
-                                ui.selectable_value(&mut self.output, output.clone(), output);
-                            }
-                        });
-                    if ui.button("Refresh outputs").clicked() {
-                        self.refresh();
-                    }
-                    ui.label("FPS:");
-                    ui.add(egui::Slider::new(&mut self.fps, 1..=60));
-                    ui.label("Fit:");
-                    ui.radio_value(&mut self.fit, Fit::Cover, "cover");
-                    ui.radio_value(&mut self.fit, Fit::Contain, "contain");
-                    ui.label("FFmpeg:");
-                    ui.text_edit_singleline(&mut self.ffmpeg);
-                    if ui.button("Preview selection").clicked() {
-                        self.preview(ctx);
-                    }
-                    if let Some(texture) = &self.preview_texture {
-                        let size = texture.size_vec2();
-                        let width = ui.available_width().min(320.0);
-                        ui.image((
-                            texture.id(),
-                            egui::vec2(width, width * size.y / size.x.max(1.0)),
-                        ));
-                    }
-                });
+            // Wide windows keep the sidebar; narrow ones collapse Browse &
+            // Playback into the central column so the gallery keeps its width.
+            let narrow = ctx.screen_rect().width() < 720.0;
+            if !narrow {
+                egui::SidePanel::left("wallbreak-filters")
+                    .resizable(true)
+                    .default_width(210.0)
+                    .width_range(160.0..=320.0)
+                    .show(ctx, |ui| {
+                        self.browse_playback(ui, ctx);
+                    });
+            }
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                if narrow {
+                    egui::CollapsingHeader::new("Browse & Playback")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            self.browse_playback(ui, ctx);
+                        });
+                    ui.separator();
+                }
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Selected:");
                     ui.text_edit_singleline(&mut self.media_path);
                     if ui.button("Inspect").clicked() {
@@ -840,10 +859,12 @@ pub mod panel {
                 if visible.is_empty() {
                     ui.label("No matching Wallpaper Engine projects.");
                 }
-                // Responsive grid: column count follows the window width.
+                // Responsive grid: column count follows the window width, with
+                // smaller target cards on narrow screens.
                 let spacing = 10.0;
                 let avail = ui.available_width();
-                let columns = ((avail / 200.0).floor() as usize).clamp(1, 8);
+                let target_card = if avail < 420.0 { 140.0 } else { 200.0 };
+                let columns = ((avail / target_card).floor() as usize).clamp(1, 8);
                 let card_width =
                     ((avail - (columns - 1) as f32 * spacing) / columns as f32).max(120.0);
                 egui::ScrollArea::vertical()

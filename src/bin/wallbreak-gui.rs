@@ -15,7 +15,9 @@ fn main() -> eframe::Result<()> {
     // Hidden smoke-test hook: open the panel briefly for headless screenshots.
     let smoke = std::env::args().any(|arg| arg == "--smoke-test");
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 750.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 750.0])
+            .with_min_inner_size([480.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(

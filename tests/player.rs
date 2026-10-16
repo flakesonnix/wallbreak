@@ -279,6 +279,37 @@ fn idle_panel_repaints_and_renders_exit_status_and_cli_diagnostics() {
     }
 }
 
+#[cfg(feature = "gui")]
+#[test]
+fn narrow_panel_collapses_sidebar_into_central_column() {
+    use eframe::egui;
+    use wallbreak::gui::panel::Panel;
+
+    for width in [500.0f32, 1200.0] {
+        let mut panel = Panel::new();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, 700.0),
+        ));
+        let output = ctx.run(input, |ctx| panel.show(ctx));
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Selected:"), "{text}");
+        if width < 720.0 {
+            assert!(text.contains("Browse & Playback"), "{text}");
+        }
+    }
+}
+
 #[test]
 #[ignore = "controlled subprocess fixture, executed by the player tests"]
 fn player_helper() {
