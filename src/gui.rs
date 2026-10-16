@@ -727,11 +727,7 @@ pub mod panel {
                         }
                         ui.label(format!(
                             "{}: {}",
-                            if running {
-                                "Running"
-                            } else {
-                                "Cleaning up"
-                            },
+                            if running { "Running" } else { "Cleaning up" },
                             self.player.description()
                         ));
                     } else if ui.button("▶ Play").clicked() {
@@ -798,6 +794,40 @@ pub mod panel {
                     }
                 });
             egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Selected:");
+                    ui.text_edit_singleline(&mut self.media_path);
+                    if ui.button("Inspect").clicked() {
+                        self.inspect();
+                    }
+                    ui.checkbox(&mut self.preview_flag, "preview image");
+                });
+                ui.label(&self.status);
+                if let Some(status) = self.player.exit_status() {
+                    let message = format!("Player exited: {status}");
+                    if status.success() {
+                        ui.label(message);
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_RED, message);
+                    }
+                }
+                let diagnostics = self.player.diagnostics();
+                if !diagnostics.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .id_source("player-diagnostics")
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.monospace(diagnostics);
+                        });
+                }
+                if !self.inspect_json.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.inspect_json);
+                        });
+                }
+                ui.separator();
                 let visible = self.visible_projects();
                 ui.horizontal(|ui| {
                     ui.heading("Wallpapers");
@@ -832,40 +862,6 @@ pub mod panel {
                         }
                     });
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Selected:");
-                    ui.text_edit_singleline(&mut self.media_path);
-                    if ui.button("Inspect").clicked() {
-                        self.inspect();
-                    }
-                    ui.checkbox(&mut self.preview_flag, "preview image");
-                });
-                ui.separator();
-                ui.label(&self.status);
-                if let Some(status) = self.player.exit_status() {
-                    let message = format!("Player exited: {status}");
-                    if status.success() {
-                        ui.label(message);
-                    } else {
-                        ui.colored_label(egui::Color32::LIGHT_RED, message);
-                    }
-                }
-                let diagnostics = self.player.diagnostics();
-                if !diagnostics.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .id_source("player-diagnostics")
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            ui.monospace(diagnostics);
-                        });
-                }
-                if !self.inspect_json.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .max_height(220.0)
-                        .show(ui, |ui| {
-                            ui.monospace(&self.inspect_json);
-                        });
-                }
             });
             if self.player.has_pending_work() {
                 ctx.request_repaint_after(Duration::from_millis(100));
