@@ -107,6 +107,9 @@ impl Args {
                 .with_icon(egui::IconData::default()),
             run_and_return: true,
             persist_window: false,
+            // A hidden clone source cannot rely on compositor frame delivery.
+            // Animation::show already paces frames; EGL must not gate shutdown.
+            vsync: false,
             ..Default::default()
         }
     }
@@ -471,6 +474,10 @@ mod tests {
         assert!(options.viewport.active.is_none());
         assert!(!options.persist_window);
         assert!(options.run_and_return);
+        assert!(
+            !options.vsync,
+            "hidden clone sources must not wait on presentation"
+        );
         args.width = 4096;
         args.height = 4096;
         args.validate().unwrap();

@@ -225,7 +225,7 @@ mod tests {
         assert!(resolve(dir.path(), false)
             .unwrap_err()
             .to_string()
-            .contains("only one zero-rotation"));
+            .contains("invalid scene model"));
         let selected = resolve(dir.path(), true).unwrap();
         assert!(selected.preview_only);
         assert_eq!(selected.declared_file.as_deref(), Some("preview.jpg"));

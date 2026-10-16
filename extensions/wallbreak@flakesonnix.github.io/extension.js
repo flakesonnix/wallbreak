@@ -11,6 +11,7 @@ import {
     BUS_NAME, OBJECT_PATH, INTERFACE, BridgeError, StderrTail,
     validateRequest, frameGeometry, rendererArgs, matchesRenderer,
 } from './protocol.mjs';
+import {OverviewClones} from './overview.mjs';
 
 const READY_MS = 20_000;
 const TERM_MS = 3_000;
@@ -18,7 +19,7 @@ const DRAIN_MS = 1_000;
 
 export default class WallbreakExtension extends Extension {
     enable() {
-        if (!Meta.is_wayland_compositor())
+        if (GLib.getenv('XDG_SESSION_TYPE') !== 'wayland')
             throw new Error('Wallbreak requires GNOME 50 on Wayland');
         this._generation ??= 0;
         this._session ??= null;
@@ -141,7 +142,8 @@ export default class WallbreakExtension extends Extension {
         const session = {
             token: GLib.uuid_string_random(), owner, generation: ++this._generation,
             state: 'starting', detail: 'Waiting for owned renderer window',
-            geometry, manager, signals: [], candidates: new Map(), pendingWindows: [],
+            geometry, manager, monitor, monitorIndex: index,
+            signals: [], candidates: new Map(), pendingWindows: [],
             tail: new StderrTail(), warnings: new Set(), reaped: false, stderrDone: false,
             settled: false, overview: Main.overview.visible || Main.overview.visibleTarget,
         };
@@ -293,6 +295,13 @@ export default class WallbreakExtension extends Extension {
             session.inhibited = true;
             session.shown = true;
             this._attachClone(session);
+            session.overviewClones = new OverviewClones(
+                session.actor, session.monitor, session.monitorIndex,
+                error => this._stop(session, `Overview integration failed: ${error.message}`, true));
+            session.overviewClones.start();
+            this._updateVisibility(session);
+            if (!this._live(session))
+                return;
             session.state = 'running';
             session.detail = 'Renderer running on the selected desktop output';
             this._clearTimer(session, 'readyTimer');
@@ -322,11 +331,12 @@ export default class WallbreakExtension extends Extension {
     }
 
     _updateVisibility(session) {
-        if (session.clone) {
-            session.clone.visible = this._live(session) && !session.overview &&
-                Main.sessionMode.hasWindows && !Main.sessionMode.isLocked &&
-                !Main.sessionMode.isGreeter && !Main.layoutManager.screenShieldGroup.visible;
-        }
+        const allowed = this._live(session) && Main.sessionMode.hasWindows &&
+            !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter &&
+            !Main.layoutManager.screenShieldGroup.visible;
+        if (session.clone)
+            session.clone.visible = allowed && !session.overview;
+        session.overviewClones?.setVisibility(allowed, session.overview);
     }
 
     _timer(milliseconds, callback) {
@@ -350,6 +360,14 @@ export default class WallbreakExtension extends Extension {
     }
 
     _cleanupVisuals(session) {
+        if (session.overviewClones) {
+            try {
+                session.overviewClones.destroy();
+                session.overviewClones = null;
+            } catch (error) {
+                this._warning(session, `Overview cleanup failed: ${error.message}`);
+            }
+        }
         session.signals = session.signals.filter(([object, id]) => {
             try {
                 object.disconnect(id);
@@ -535,7 +553,8 @@ export default class WallbreakExtension extends Extension {
         if (session.settled || !session.reaped || !session.stderrDone)
             return;
         this._cleanupVisuals(session);
-        if (session.inhibited || session.signals.length > 0 || session.clone) {
+        if (session.inhibited || session.signals.length > 0 || session.clone ||
+            session.overviewClones?.hasResources) {
             session.failure ??= 'Shell resource cleanup is incomplete';
             if (!session.cleanupTimer) {
                 session.cleanupTimer = this._timer(1_000, () => {
@@ -558,6 +577,8 @@ export default class WallbreakExtension extends Extension {
         session.window = null;
         session.actor = null;
         session.manager = null;
+        session.monitor = null;
+        session.overviewClones = null;
         if (session.ownerGone || session.discardFinal || !this._enabled) {
             this._unwatchOwner(session);
             if (this._current(session))

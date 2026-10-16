@@ -182,14 +182,14 @@ class Process {
     }
 }
 
-async function harness() {
+async function harness({sessionType = 'wayland'} = {}) {
     const timers = new Map();
     const watches = new Map();
     const busOwners = new Map();
     const spawned = [];
     const warnings = [];
     const display = new Signals();
-    const overview = new Signals();
+    const overview = Object.assign(new Signals(), {visible: false, visibleTarget: false});
     const sessionMode = Object.assign(new Signals(), {hasWindows: true, isLocked: false});
     const manager = Object.assign(new Signals(), {backgroundActor: new Actor()});
     const layoutManager = Object.assign(new Signals(), {
@@ -200,12 +200,13 @@ async function harness() {
     let now = 0;
     let sequence = 0;
     const h = {timers, watches, busOwners, spawned, warnings, display, overview,
-        sessionMode, manager, layoutManager, scale: 1};
+        sessionMode, manager, layoutManager, scale: 1, overviewOwners: []};
     display.get_monitor_scale = () => h.scale;
     const global = {display, context: {}, backend: {get_monitor_manager: () => ({
         get_monitor_for_connector: output => output === 'DP-1' ? 0 : -1,
     })}};
     const GLib = {
+        getenv: name => name === 'XDG_SESSION_TYPE' ? sessionType : null,
         PRIORITY_DEFAULT: 0, SOURCE_REMOVE: false,
         uuid_string_random: () => `00000000-0000-4000-8000-${String(++sequence).padStart(12, '0')}`,
         Variant: class {
@@ -259,7 +260,7 @@ async function harness() {
         },
     };
     const Meta = {
-        is_wayland_compositor: () => true, WindowClientType: {WAYLAND: 1}, WindowType: {UTILITY: 4},
+        WindowClientType: {WAYLAND: 1}, WindowType: {UTILITY: 4},
         WaylandClient: {new_subprocess: (context, _launcher, argv) => {
             assert.equal(context, global.context);
             assert.ok([...display.handlers.values()].some(signal => signal.name === 'window-created'));
@@ -280,6 +281,27 @@ async function harness() {
             return {load_contents: () => [true, new TextEncoder().encode(xml)]};
         }};
     }
+    // The overview owner has its own full-module tests. Here verify that the
+    // session passes ownership/privacy facts and waits for its cleanup.
+    class OverviewClones {
+        constructor(source, monitor, index, onError) {
+            Object.assign(this, {source, monitor, index, onError, hasResources: false});
+            h.overviewOwners.push(this);
+        }
+        start() {
+            this.hasResources = true;
+            if (h.overviewStartError)
+                this.onError(new Error('overview startup failed'));
+        }
+        setVisibility(allowed, overviewVisible) {
+            Object.assign(this, {allowed, overviewVisible});
+        }
+        destroy() {
+            if (h.overviewCleanupError)
+                throw new Error('overview cleanup failed');
+            Object.assign(this, {hasResources: false, destroyed: true, source: null, onError: null});
+        }
+    }
     const context = vm.createContext({
         global, TextDecoder, TextEncoder, Uint8Array, console: {error: text => warnings.push(text)},
     });
@@ -288,6 +310,7 @@ async function harness() {
         ['gi://GLib', {default: GLib}], ['gi://Meta', {default: Meta}],
         ['resource:///org/gnome/shell/extensions/extension.js', {Extension}],
         ['resource:///org/gnome/shell/ui/main.js', {layoutManager, overview, sessionMode}],
+        ['./overview.mjs', {OverviewClones}],
     ]);
     const module = new vm.SourceTextModule(extensionSource, {context});
     await module.link(specifier => {
@@ -357,6 +380,13 @@ async function harness() {
     h.process = () => spawned.at(-1).process;
     return h;
 }
+
+test('activation uses GNOME 50 session information without a removed Meta API', async () => {
+    const h = await harness();
+    assert.deepEqual(h.call('Info').value, [1]);
+    for (const sessionType of ['x11', '', null])
+        await assert.rejects(harness({sessionType}), /requires GNOME 50 on Wayland/);
+});
 
 test('metadata and canonical D-Bus contract are GNOME 50/protocol 1 only', async () => {
     assert.equal(metadata.uuid, 'wallbreak@flakesonnix.github.io');
@@ -461,7 +491,7 @@ test('Start validates file, connector and geometry before spawning; never replac
     assert.deepEqual(h.process().sent, []);
 });
 
-test('delayed metadata, first shown, clone reattachment and desktop-only visibility', async () => {
+test('delayed metadata, clone reattachment and overview visibility keep the same privacy gate', async () => {
     const h = await harness();
     const token = h.start();
     const window = h.window(token, {title: null, appId: null});
@@ -484,21 +514,33 @@ test('delayed metadata, first shown, clone reattachment and desktop-only visibil
     assert.equal(clone.reactive, false);
     assert.equal(window.actor.parent, window.sourceParent);
     assert.equal(clone.visible, true);
+    const overview = h.overviewOwners[0];
+    assert.equal(overview.source, window.actor);
+    assert.equal(overview.monitor, h.layoutManager.monitors[0]);
+    assert.equal(overview.index, 0);
+    assert.equal(overview.allowed, true);
+    assert.equal(overview.overviewVisible, false);
     h.overview.emit('showing');
     assert.equal(clone.visible, false);
+    assert.equal(overview.allowed, true);
+    assert.equal(overview.overviewVisible, true);
     h.overview.emit('hidden');
     assert.equal(clone.visible, true);
+    assert.equal(overview.overviewVisible, false);
     h.sessionMode.isLocked = true;
     h.sessionMode.emit('updated');
     assert.equal(clone.visible, false);
+    assert.equal(overview.allowed, false);
     h.sessionMode.isLocked = false;
     h.sessionMode.emit('updated');
     h.layoutManager.screenShieldGroup.visible = true;
     h.layoutManager.screenShieldGroup.emit('notify::visible');
     assert.equal(clone.visible, false);
+    assert.equal(overview.allowed, false);
     h.layoutManager.screenShieldGroup.visible = false;
     h.layoutManager.screenShieldGroup.emit('notify::visible');
     assert.equal(clone.visible, true);
+    assert.equal(overview.allowed, true);
     const old = h.manager.backgroundActor;
     h.manager.backgroundActor = new Actor();
     h.manager.emit('changed');
@@ -514,10 +556,76 @@ test('delayed metadata, first shown, clone reattachment and desktop-only visibil
     assert.equal(window.actor.opacity, 0, 'do not flash the source during shutdown');
     assert.equal(window.actor.parent, window.sourceParent);
     assert.equal(clone.destroyed, true);
+    assert.equal(overview.destroyed, true);
+    assert.equal(overview.hasResources, false);
+    assert.equal(overview.source, null);
     assert.equal(h.status(token).value[0], 'stopped');
     assert.equal(h.timers.size, 0);
     assert.equal(h.display.handlers.size, 0);
     assert.equal(window.handlers.size, 0);
+});
+
+test('playback started in overview shows there without changing desktop focus or lock visibility', async () => {
+    const h = await harness();
+    h.overview.visible = true;
+    const token = h.start();
+    const window = h.window(token);
+    window.shown();
+    assert.equal(h.status(token).value[0], 'running');
+    assert.equal(h.manager.backgroundActor.children[0].visible, false);
+    const owner = h.overviewOwners[0];
+    assert.equal(owner.allowed, true);
+    assert.equal(owner.overviewVisible, true);
+    for (const [field, value] of [['isLocked', true], ['isGreeter', true], ['hasWindows', false]]) {
+        const previous = h.sessionMode[field];
+        h.sessionMode[field] = value;
+        h.sessionMode.emit('updated');
+        assert.equal(owner.allowed, false, field);
+        h.sessionMode[field] = previous;
+    }
+    h.layoutManager.screenShieldGroup.visible = true;
+    h.layoutManager.screenShieldGroup.emit('notify::visible');
+    assert.equal(owner.allowed, false);
+    h.call('Stop', [token]);
+    h.process().exit();
+    await flush();
+    assert.equal(owner.destroyed, true);
+});
+
+test('overview startup failure cannot resurrect a stopping session as running', async () => {
+    const h = await harness();
+    h.overviewStartError = true;
+    const token = h.start();
+    h.window(token).shown();
+    assert.equal(h.status(token).value[0], 'stopping');
+    assert.deepEqual(h.process().sent, [15]);
+    assert.equal(h.overviewOwners[0].destroyed, true);
+    h.process().exit();
+    await flush();
+    assert.equal(h.status(token).value[0], 'failed');
+    assert.match(h.status(token).value[1], /Overview integration failed/);
+});
+
+test('failed overview cleanup retains the session until its resources are released', async () => {
+    const h = await harness();
+    const token = h.start();
+    h.window(token).shown();
+    const owner = h.overviewOwners[0];
+    h.overviewCleanupError = true;
+    h.call('Stop', [token]);
+    h.process().exit();
+    await flush();
+    assert.equal(h.extension._session.overviewClones, owner);
+    assert.equal(owner.hasResources, true);
+    assert.equal(h.extension._session.settled, false);
+    assert.match(h.call('Start', request).error, /Busy$/);
+    h.overviewCleanupError = false;
+    await h.advance(1000);
+    assert.equal(owner.hasResources, false);
+    assert.equal(h.extension._session.overviewClones, null);
+    assert.equal(h.extension._session.settled, true);
+    assert.equal(h.status(token).value[0], 'failed');
+    assert.match(h.status(token).value[1], /Overview cleanup failed/);
 });
 
 test('spoofed/foreign windows are never touched and readiness timeout tears down only the child', async () => {

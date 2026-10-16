@@ -167,7 +167,7 @@ fn decode(bytes: &[u8]) -> Result<Texture> {
     );
     let flags = reader.word()?;
     ensure!(
-        flags == 0,
+        flags == 0 || flags == 0x2,
         "unsupported TEX flags {flags:#x}; only regular textures are supported"
     );
     let width = reader.word()?;

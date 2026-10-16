@@ -43,10 +43,7 @@ mod tests {
             let mut daemon = Command::new(program);
             // Sandboxes without /etc/dbus-1 supply a minimal session config.
             if let Some(config) = std::env::var_os("WALLBREAK_TEST_DBUS_CONFIG") {
-                daemon.arg(format!(
-                    "--config-file={}",
-                    config.to_string_lossy()
-                ));
+                daemon.arg(format!("--config-file={}", config.to_string_lossy()));
             } else {
                 daemon.arg("--session");
             }

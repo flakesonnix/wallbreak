@@ -47,10 +47,10 @@
           </busconfig>
           EOF
           export WALLBREAK_TEST_DBUS_CONFIG="$PWD/wallbreak-test-session.conf"
-          cargo test --offline --locked --release --features gui --lib --bins --test cli --test scene -- --include-ignored
-          cargo test --offline --locked --release --features gui --test player --test headless --test gui --test renderer --test gnome_bridge
-          cargo test --offline --locked --release --features gui --test gnome -- --ignored
-          node --experimental-vm-modules --test tests/gnome-extension.test.mjs
+          cargo test --offline --locked --release --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} --features gui --lib --bins --test cli --test scene -- --include-ignored
+          cargo test --offline --locked --release --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} --features gui --test player --test headless --test gui --test renderer --test gnome_bridge
+          cargo test --offline --locked --release --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} --features gui --test gnome -- --ignored
+          node --experimental-vm-modules --test tests/gnome-extension.test.mjs tests/gnome-overview.test.mjs
           runHook postCheck
         '';
         postInstall = ''

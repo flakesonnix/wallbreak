@@ -2,9 +2,10 @@
 
 An independent, experimental Rust image/video and one-scene wallpaper player
 for Linux Wayland compositors implementing `wlr-layer-shell`, tested with Sway.
-GNOME has a separate, static-image-only backend using `gsettings`. GNOME does
-not support animated videos or scenes through wallbreak; these requests fail
-with an explicit diagnostic rather than opening an ordinary window.
+GNOME has a static-image backend using `gsettings` and an optional GNOME 50
+Shell bridge for videos and the supported animated scene. The bridge must be
+installed and enabled separately; wallbreak never substitutes a foreground
+window when it is unavailable.
 It is not a full Wallpaper Engine clone. No Steam,
 Wine, or Wallpaper Engine executable is launched.
 
@@ -49,8 +50,8 @@ nix run .#cli -- play /absolute/path/to/image.jpg --output eDP-1
 nix run .#cli -- play /absolute/path/to/video.mp4 --output eDP-1 --fps 30 --fit cover
 ```
 
-Use an exact output name returned by `outputs`. Without `--output`, the first
-compositor-advertised output is selected, not an inferred primary monitor. Each
+Use an exact output name returned by `outputs`. Without `--output`, layer-shell
+uses the first advertised output; GNOME animation uses the primary display. Each
 process owns one output. `--fit contain` adds black bars instead of cropping.
 Ctrl-C or SIGTERM removes the player's background surface and stops/reaps its
 decoder. `--duration-seconds 15` limits a trial run. No startup service or desktop
@@ -61,7 +62,7 @@ static project image. Leave output selection unset: GNOME applies its image to
 all displays. The backend updates both light/dark image URIs and the picture
 mode, then restores its prior values on Stop, normal GUI close, SIGINT/SIGTERM,
 or a duration deadline. Settings changed by you or another app during playback
-are retained. A per-user runtime lock rejects simultaneous GNOME players.
+are retained. A per-user runtime lock rejects simultaneous static GNOME players.
 Forced termination (SIGKILL), power loss, and external settings-service failures
 can prevent restoration; those cases are not a persistent configuration service.
 
@@ -69,7 +70,51 @@ can prevent restoration; those cases are not a persistent configuration service.
 nix run .#cli -- play /absolute/path/to/image.jpg --duration-seconds 15
 ```
 
-GUI playback errors, including missing layer-shell, unsupported GNOME animation,
+### GNOME Animation
+
+The optional bridge supports GNOME 50 on Wayland. For an initial installation:
+
+```bash
+gnome-extensions install "$(nix run .#cli -- gnome-extension)"
+gnome-extensions enable wallbreak@flakesonnix.github.io
+```
+
+These are explicit user actions, not automatic setup. Existing extension copies
+are not overwritten by this install command. GNOME may require signing out and
+back in to discover a new extension or reload previously imported code.
+
+Check activation before playing:
+
+```bash
+gnome-extensions info wallbreak@flakesonnix.github.io
+gdbus call --session --dest io.github.flakesonnix.Wallbreak \
+  --object-path /io/github/flakesonnix/Wallbreak \
+  --method io.github.flakesonnix.Wallbreak1.Info
+```
+
+Expect `State: ACTIVE` and protocol `1`. An `ERROR` state requires checking the
+extension error, not repeatedly enabling it. A loaded error-state module cannot
+be refreshed by simply toggling enable/disable in the same Shell session.
+
+Select the original Eagle Flag project (without `--preview`) and use Play, or
+run `play /absolute/path/to/eagleflag --duration-seconds 10`. The bridge owns a
+dedicated renderer and displays its cloned actor below application windows.
+Pressing Super keeps the animation visible behind the overview controls and in
+the large workspace cards for the selected monitor. Small window thumbnails
+retain GNOME's native layout. The extension does not animate the lock/login
+screen or alter other monitors' backgrounds.
+Stop removes that session; it does not replace the GNOME background settings.
+The renderer paces its own frames without VSync, so hidden-source presentation
+cannot add a VSync wait to graceful shutdown.
+
+After updating the extension files, previously loaded Shell modules remain
+cached until the next login; toggling enable/disable does not reload their code.
+Overview behavior has simulated lifecycle/geometry regression coverage; live
+GPU clipping and appearance still require checking after that reload.
+Overview cards use additional cloned surfaces and a rounded clipping effect;
+their GPU/memory cost has not been benchmarked.
+
+GUI playback errors, including missing layer-shell, an unavailable GNOME bridge,
 and decoder errors, remain visible in the panel. Stop requests graceful cleanup
 before escalation; a forced kill is reported and cannot guarantee restoration.
 
@@ -100,14 +145,23 @@ missing media, and unsupported scene features fail rather than silently
 choosing another file or preview. Backslash-separated project paths are not
 supported.
 
-Only this scene profile is supported: one zero-rotation image quad, one
-`flag`-shader pass with `TINT=1`, three native `.tex` textures, disabled depth
-testing/writing, and the project's three declared tint colors. It renders the
-project's animated flag material from native textures. Web, application, packed
-`scene.pkg`, multi-object, rotated, scripted, particle, 3D, perspective, bloom,
-and other shader/material projects remain unsupported. For those projects,
-explicit `--preview` selects only the declared static preview and reports
-`preview_only: true`:
+Supported scene content: layered orthographic image quads (in-plane rotation
+allowed), composited back-to-front, with these material profiles:
+
+- `flag` with `TINT=1`, three native `.tex` textures, and the project's three
+  declared tint colors (Eagle Flag).
+- `genericimage`/`genericimage2` with default shading, one texture, optional
+  brightness/alpha/power/scroll constants, and opaque/translucent/additive
+  blending.
+- `flowimage` with two textures (base plus flow mask) or four textures (mask
+  plus three parallax layers), with per-layer speeds.
+- `swayimage` with two textures (base plus sway mask).
+
+All textures must be native `.tex`; depth testing/writing must be disabled.
+Web, application, packed `scene.pkg`, scripted, particle, 3D, perspective,
+bloom, spritesheet, lighting, and other shader/material projects remain
+unsupported. For those projects, explicit `--preview` selects only the declared
+static preview and reports `preview_only: true`:
 
 ```bash
 project="$HOME/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach"
@@ -194,7 +248,7 @@ configuration. It checks output discovery, actual image pixels, changing video
 pixels, resize, scale, automatic stop, SIGTERM, surface removal, and, when a
 scene root is supplied, changing animated-scene pixels. It never connects to
 the existing desktop's socket. It generates its own image/video media; no
-commercial fixture is required. X11, GNOME animation, other scene shaders, JavaScript
+commercial fixture is required. X11, other scene shaders, JavaScript
 scenes, packed `scene.pkg` content, interactive wallpapers, and full Wallpaper
 Engine compatibility remain unsupported.
 
