@@ -408,6 +408,9 @@ pub mod panel {
         pub preview_flag: bool,
         pub projects: Vec<ProjectEntry>,
         pub project: String,
+        pub search: String,
+        pub kind_filter: String,
+        pub supported_only: bool,
         pub thumbnails: std::collections::HashMap<String, egui::ColorImage>,
         pub thumb_textures: std::collections::HashMap<String, egui::TextureHandle>,
         pub outputs: Vec<String>,
@@ -435,6 +438,9 @@ pub mod panel {
                 preview_flag: false,
                 projects: Vec::new(),
                 project: String::new(),
+                search: String::new(),
+                kind_filter: "All".to_string(),
+                supported_only: false,
                 thumbnails: std::collections::HashMap::new(),
                 thumb_textures: std::collections::HashMap::new(),
                 outputs: Vec::new(),
@@ -487,6 +493,94 @@ pub mod panel {
             self.media_path = entry.path.to_string_lossy().into_owned();
             self.preview_flag = false;
             self.status = entry.support_note.clone();
+        }
+
+        fn visible_projects(&self) -> Vec<ProjectEntry> {
+            let query = self.search.to_lowercase();
+            self.projects
+                .iter()
+                .filter(|entry| {
+                    (self.kind_filter == "All" || entry.kind == self.kind_filter)
+                        && (!self.supported_only || entry.supported)
+                        && (query.is_empty() || entry.title.to_lowercase().contains(&query))
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// One gallery card; returns true when selected by click.
+        fn project_card(
+            &mut self,
+            ui: &mut egui::Ui,
+            ctx: &egui::Context,
+            entry: &ProjectEntry,
+            card_width: f32,
+        ) -> bool {
+            let selected = self.project == entry.id;
+            let mut clicked = false;
+            egui::Frame::group(ui.style())
+                .fill(if selected {
+                    ui.style().visuals.selection.bg_fill
+                } else {
+                    ui.style().visuals.faint_bg_color
+                })
+                .show(ui, |ui| {
+                    ui.set_width(card_width);
+                    if let Some(image) = self.thumbnails.get(&entry.id).cloned() {
+                        let texture =
+                            self.thumb_textures
+                                .entry(entry.id.clone())
+                                .or_insert_with(|| {
+                                    ctx.load_texture(
+                                        format!("wallbreak-project-{}", entry.id),
+                                        image,
+                                        Default::default(),
+                                    )
+                                });
+                        let aspect = texture.size_vec2();
+                        // Fixed 16:10 viewport with center crop, like WE cards.
+                        let target = egui::vec2(card_width, card_width * 10.0 / 16.0);
+                        let scale =
+                            (target.x / aspect.x.max(1.0)).max(target.y / aspect.y.max(1.0));
+                        let shown = egui::vec2(aspect.x * scale, aspect.y * scale);
+                        let uv = egui::Rect::from_min_max(
+                            egui::pos2(
+                                ((shown.x - target.x) / 2.0 / shown.x).max(0.0),
+                                ((shown.y - target.y) / 2.0 / shown.y).max(0.0),
+                            ),
+                            egui::pos2(
+                                1.0 - ((shown.x - target.x) / 2.0 / shown.x).max(0.0),
+                                1.0 - ((shown.y - target.y) / 2.0 / shown.y).max(0.0),
+                            ),
+                        );
+                        if ui
+                            .add(
+                                egui::ImageButton::new((texture.id(), target))
+                                    .uv(uv)
+                                    .selected(selected)
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            clicked = true;
+                        }
+                    }
+                    let badge = if entry.supported { "✓" } else { "✗" };
+                    ui.label(
+                        egui::RichText::new(format!("{} {}", badge, entry.title))
+                            .small()
+                            .strong(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.small_button(&entry.kind).clicked() {
+                            clicked = true;
+                        }
+                        if !entry.supported {
+                            ui.small(egui::RichText::new("unsupported").weak());
+                        }
+                    });
+                });
+            clicked
         }
 
         pub fn refresh(&mut self) {
@@ -620,108 +714,56 @@ pub mod panel {
                     self.status = "Dropped file selected. Inspect or Play.".to_string();
                 }
             }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("wallbreak");
-                ui.label("Drop a media file here, or type its path.");
-                if crate::gnome::is_current() {
-                    ui.label("GNOME: video/scene animation requires the optional GNOME 50 Shell bridge. Installation/activation are never automatic. Static images need no extension.");
-                }
+            egui::TopBottomPanel::top("wallbreak-top").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Wallpapers");
+                    ui.heading("wallbreak");
+                    ui.label("Drop a media file anywhere, or pick a wallpaper below.");
                     if ui.button("Rescan Steam").clicked() {
                         self.refresh_projects();
                     }
-                    if self.projects.is_empty() {
-                        ui.label("No Wallpaper Engine projects found.");
+                    if self.player.has_pending_work() {
+                        if ui.button("⏹ Stop").clicked() {
+                            self.stop();
+                        }
+                        ui.label(format!(
+                            "{}: {}",
+                            if running {
+                                "Running"
+                            } else {
+                                "Cleaning up"
+                            },
+                            self.player.description()
+                        ));
+                    } else if ui.button("▶ Play").clicked() {
+                        self.play();
                     }
                 });
-                egui::ScrollArea::vertical()
-                    .id_source("project-gallery")
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                            for entry in self.projects.clone() {
-                                let selected = self.project == entry.id;
-                                let badge = if entry.supported { "✓" } else { "✗" };
-                                let mut clicked = false;
-                                egui::Frame::group(ui.style())
-                                    .fill(if selected {
-                                        ui.style().visuals.selection.bg_fill
-                                    } else {
-                                        ui.style().visuals.faint_bg_color
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.set_width(150.0);
-                                        if let Some(image) =
-                                            self.thumbnails.get(&entry.id).cloned()
-                                        {
-                                            let texture =
-                                                self.thumb_textures.entry(entry.id.clone()).or_insert_with(
-                                                    || {
-                                                        ctx.load_texture(
-                                                            format!(
-                                                                "wallbreak-project-{}",
-                                                                entry.id
-                                                            ),
-                                                            image,
-                                                            Default::default(),
-                                                        )
-                                                    },
-                                                );
-                                            let aspect = texture.size_vec2();
-                                            let height = 84.0f32.min(
-                                                150.0 * aspect.y / aspect.x.max(1.0),
-                                            );
-                                            if ui
-                                                .add(
-                                                    egui::ImageButton::new((
-                                                        texture.id(),
-                                                        egui::vec2(150.0, height),
-                                                    ))
-                                                    .selected(selected)
-                                                    .frame(false),
-                                                )
-                                                .clicked()
-                                            {
-                                                clicked = true;
-                                            }
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} {}",
-                                                badge, entry.title
-                                            ))
-                                            .small()
-                                            .strong(),
-                                        );
-                                        if ui
-                                            .small_button(&entry.kind)
-                                            .clicked()
-                                        {
-                                            clicked = true;
-                                        }
-                                    });
-                                if clicked {
-                                    self.select_project(&entry);
-                                }
+            });
+            if crate::gnome::is_current() {
+                egui::TopBottomPanel::top("wallbreak-gnome-note").show(ctx, |ui| {
+                    ui.label("GNOME: video/scene animation requires the optional GNOME 50 Shell bridge. Static images need no extension.");
+                });
+            }
+            egui::SidePanel::left("wallbreak-filters")
+                .resizable(true)
+                .default_width(210.0)
+                .show(ctx, |ui| {
+                    ui.heading("Browse");
+                    ui.label("Search:");
+                    ui.text_edit_singleline(&mut self.search);
+                    ui.label("Type:");
+                    egui::ComboBox::from_id_source("kind-filter")
+                        .selected_text(&self.kind_filter)
+                        .show_ui(ui, |ui| {
+                            for kind in ["All", "scene", "video", "web", "unknown"] {
+                                ui.selectable_value(&mut self.kind_filter, kind.to_string(), kind);
                             }
                         });
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("Media:");
-                    ui.text_edit_singleline(&mut self.media_path);
-                    if ui.button("Inspect").clicked() {
-                        self.inspect();
-                    }
-                });
-                ui.checkbox(
-                    &mut self.preview_flag,
-                    "Use project preview instead of rendering",
-                );
-                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.supported_only, "Supported only");
+                    ui.separator();
+                    ui.heading("Playback");
                     ui.label("Output:");
-                        egui::ComboBox::from_id_source("output")
+                    egui::ComboBox::from_id_source("output")
                         .selected_text(if self.output.is_empty() {
                             "default".to_string()
                         } else {
@@ -736,38 +778,67 @@ pub mod panel {
                     if ui.button("Refresh outputs").clicked() {
                         self.refresh();
                     }
-                });
-                ui.horizontal(|ui| {
                     ui.label("FPS:");
                     ui.add(egui::Slider::new(&mut self.fps, 1..=60));
                     ui.label("Fit:");
                     ui.radio_value(&mut self.fit, Fit::Cover, "cover");
                     ui.radio_value(&mut self.fit, Fit::Contain, "contain");
-                });
-                ui.horizontal(|ui| {
                     ui.label("FFmpeg:");
                     ui.text_edit_singleline(&mut self.ffmpeg);
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Preview").clicked() {
+                    if ui.button("Preview selection").clicked() {
                         self.preview(ctx);
                     }
-                    if self.player.has_pending_work() {
-                        if ui.button("Stop").clicked() {
-                            self.stop();
-                        }
-                        ui.label(format!(
-                            "{}: {}",
-                            if running {
-                                "Process running"
-                            } else {
-                                "Cleanup pending"
-                            },
-                            self.player.description()
+                    if let Some(texture) = &self.preview_texture {
+                        let size = texture.size_vec2();
+                        let width = ui.available_width().min(320.0);
+                        ui.image((
+                            texture.id(),
+                            egui::vec2(width, width * size.y / size.x.max(1.0)),
                         ));
-                    } else if ui.button("Play").clicked() {
-                        self.play();
                     }
+                });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let visible = self.visible_projects();
+                ui.horizontal(|ui| {
+                    ui.heading("Wallpapers");
+                    ui.label(format!(
+                        "{} shown ({} installed)",
+                        visible.len(),
+                        self.projects.len()
+                    ));
+                });
+                if visible.is_empty() {
+                    ui.label("No matching Wallpaper Engine projects.");
+                }
+                // Responsive grid: column count follows the window width.
+                let spacing = 10.0;
+                let avail = ui.available_width();
+                let columns = ((avail / 200.0).floor() as usize).clamp(1, 8);
+                let card_width =
+                    ((avail - (columns - 1) as f32 * spacing) / columns as f32).max(120.0);
+                egui::ScrollArea::vertical()
+                    .id_source("project-gallery")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for row in visible.chunks(columns) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                                for entry in row {
+                                    if self.project_card(ui, ctx, entry, card_width) {
+                                        self.select_project(entry);
+                                    }
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Selected:");
+                    ui.text_edit_singleline(&mut self.media_path);
+                    if ui.button("Inspect").clicked() {
+                        self.inspect();
+                    }
+                    ui.checkbox(&mut self.preview_flag, "preview image");
                 });
                 ui.separator();
                 ui.label(&self.status);
@@ -787,9 +858,6 @@ pub mod panel {
                         .show(ui, |ui| {
                             ui.monospace(diagnostics);
                         });
-                }
-                if let Some(texture) = &self.preview_texture {
-                    ui.image(texture);
                 }
                 if !self.inspect_json.is_empty() {
                     egui::ScrollArea::vertical()
