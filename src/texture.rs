@@ -1,9 +1,14 @@
-//! Read-only, deliberately narrow TEXV0005/TEXI0001/TEXB0003 support.
-//! No embedded image fallback, animation, cubemaps, encryption, or target execution.
+//! Bounded static-image and narrow TEXV0005/TEXI0001/TEXB0003 decoding.
+//! No animation, cubemaps, encryption, or target execution.
 
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{BufRead, Cursor, Read, Seek},
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
+use image::{ImageDecoder, ImageReader, RgbaImage};
 
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RGBA_BYTES: usize = 64 * 1024 * 1024;
@@ -67,11 +72,10 @@ pub fn is_image_path(path: &Path) -> bool {
 pub fn load_any(path: &Path) -> Result<Texture> {
     if is_image_path(path) {
         let bytes = read_bounded(path, "image")?;
-        let image = image::load_from_memory(&bytes)
-            .with_context(|| format!("invalid image {}", path.display()))?
-            .into_rgba8();
+        let reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
+        let image = decode_rgba(reader, image_limits(), None)
+            .with_context(|| format!("invalid image {}", path.display()))?;
         let (width, height) = image.dimensions();
-        rgba_len(width, height)?;
         return Ok(Texture {
             width,
             height,
@@ -85,15 +89,15 @@ pub fn load_any(path: &Path) -> Result<Texture> {
     load(path)
 }
 
-/// Read the stored dimensions of a TEX or image file without decoding pixels.
+/// Read the logical dimensions of a TEX or image file without decoding pixels.
 pub fn dimensions(path: &Path) -> Result<(u32, u32)> {
     if is_image_path(path) {
         let bytes = read_bounded(path, "image")?;
-        let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        let reader = ImageReader::new(Cursor::new(&bytes))
             .with_guessed_format()
             .with_context(|| format!("cannot inspect image {}", path.display()))?;
-        return reader
-            .into_dimensions()
+        return image_decoder(reader, image_limits(), None)
+            .map(|decoder| decoder.dimensions())
             .with_context(|| format!("cannot read image dimensions {}", path.display()));
     }
     let file = File::open(path).with_context(|| format!("cannot open TEX {}", path.display()))?;
@@ -214,16 +218,51 @@ impl<'a> Reader<'a> {
 }
 
 fn rgba_len(width: u32, height: u32) -> Result<usize> {
-    ensure!(width > 0 && height > 0, "TEX dimensions must be nonzero");
+    ensure!(width > 0 && height > 0, "image dimensions must be nonzero");
     let len = u64::from(width)
         .checked_mul(u64::from(height))
         .and_then(|n| n.checked_mul(4))
-        .context("TEX RGBA expansion overflow")?;
-    ensure!(
-        len <= MAX_RGBA_BYTES as u64,
-        "TEX RGBA exceeds 64 MiB budget"
-    );
+        .context("RGBA expansion overflow")?;
+    ensure!(len <= MAX_RGBA_BYTES as u64, "RGBA exceeds 64 MiB budget");
     Ok(len as usize)
+}
+
+fn image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_RGBA_BYTES as u64);
+    limits
+}
+
+fn image_decoder<'a, R: BufRead + Seek + 'a>(
+    mut reader: ImageReader<R>,
+    mut limits: image::Limits,
+    expected: Option<(u32, u32)>,
+) -> Result<impl ImageDecoder + 'a> {
+    // PNG needs allocation limits at construction, before reading its metadata.
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    if let Some((ew, eh)) = expected {
+        ensure!(
+            (width, height) == (ew, eh),
+            "image is {width}x{height}, expected {ew}x{eh}"
+        );
+    }
+    // Source allocation limits alone do not bound grayscale/RGB-to-RGBA expansion.
+    rgba_len(width, height)?;
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    Ok(decoder)
+}
+
+/// Admit decoder-owned dimensions and source/RGBA allocations before reading pixels.
+pub(crate) fn decode_rgba<R: BufRead + Seek>(
+    reader: ImageReader<R>,
+    limits: image::Limits,
+    expected: Option<(u32, u32)>,
+) -> Result<RgbaImage> {
+    let decoder = image_decoder(reader, limits, expected)?;
+    Ok(image::DynamicImage::from_decoder(decoder)?.into_rgba8())
 }
 
 fn decode(bytes: &[u8]) -> Result<Texture> {
@@ -355,22 +394,17 @@ fn decode(bytes: &[u8]) -> Result<Texture> {
         reader.offset
     );
 
-    let mut rgba = vec![0; base_len];
     if packed {
         // Packed mips carry standard encoded image files (JPEG/PNG); only the
         // base level is used, matching the regular TEX behavior.
         ensure!(format == 0, "packed TEX must use the RGBA layout");
         let mip = &mips[0];
-        let image = image::load_from_memory(mip.payload)
-            .with_context(|| "invalid packed TEX base image")?
-            .into_rgba8();
-        ensure!(
-            image.width() == stored_width && image.height() == stored_height,
-            "packed TEX base image is {}x{}, expected {stored_width}x{stored_height}",
-            image.width(),
-            image.height()
-        );
-        rgba.copy_from_slice(image.as_raw());
+        let image = decode_rgba(
+            ImageReader::new(Cursor::new(mip.payload)).with_guessed_format()?,
+            image_limits(),
+            Some((stored_width, stored_height)),
+        )
+        .context("invalid packed TEX base image")?;
         return Ok(Texture {
             width: stored_width,
             height: stored_height,
@@ -378,9 +412,10 @@ fn decode(bytes: &[u8]) -> Result<Texture> {
             image_height,
             format,
             flags,
-            rgba,
+            rgba: image.into_raw(),
         });
     }
+    let mut rgba = vec![0; base_len];
     let mut scratch = Vec::new();
     for (level, mip) in mips.iter().enumerate() {
         let data = if mip.compression == 0 {
@@ -524,22 +559,30 @@ mod tests {
     }
 
     #[test]
-    fn packed_tex_decodes_the_embedded_base_image() {
-        let mut source = image::RgbaImage::new(2, 1);
-        source.put_pixel(0, 0, image::Rgba([1, 2, 3, 4]));
-        source.put_pixel(1, 0, image::Rgba([5, 6, 7, 8]));
+    fn raw_and_packed_images_preserve_channels_and_row_order() {
+        let pixels: Vec<u8> = (1..=16).collect();
+        let source = RgbaImage::from_raw(2, 2, pixels.clone()).unwrap();
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(source)
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.png");
+        std::fs::write(&path, &png).unwrap();
+        assert_eq!(dimensions(&path).unwrap(), (2, 2));
+        let texture = load_any(&path).unwrap();
+        assert_eq!((texture.width, texture.height), (2, 2));
+        assert_eq!(texture.rgba, pixels);
         for image_format in [2u32, 13] {
             let flags = if image_format == 13 { 0x22 } else { 0x2 };
-            let mut fixture = Fixture::new(0, 2, 1);
+            let mut fixture = Fixture::new(0, 2, 2);
             fixture.word(22, flags);
-            fixture.packed_mip(image_format, 2, 1, &png);
+            fixture.packed_mip(image_format, 2, 2, &png);
+            fixture.packed_mip(image_format, 1, 1, b"unused mip");
             let texture = fixture.decode().unwrap();
-            assert_eq!((texture.width, texture.height), (2, 1));
-            assert_eq!(texture.rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!((texture.width, texture.height), (2, 2));
+            assert_eq!((texture.format, texture.flags), (0, flags));
+            assert_eq!(texture.rgba, pixels);
         }
     }
 
@@ -553,6 +596,37 @@ mod tests {
         let mut fixture = Fixture::new(0, 2, 1);
         fixture.packed_mip(2, 1, 1, &png);
         fixture.rejects("invalid TEX mip 0 dimensions");
+
+        // Keep a complete header, but no pixel payload: mismatch must win over decoding.
+        let idat = png.windows(4).position(|bytes| bytes == b"IDAT").unwrap();
+        for payload in [&png[..], &png[..idat + 4]] {
+            for image_format in [2, 13] {
+                let mut fixture = Fixture::new(0, 1, 1);
+                fixture.packed_mip(image_format, 1, 1, payload);
+                fixture.rejects("image is 2x1, expected 1x1");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_and_packed_images_reject_malformed_pixel_payloads() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(RgbaImage::new(2, 1))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let idat = png.windows(4).position(|bytes| bytes == b"IDAT").unwrap();
+        png.truncate(idat + 4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.png");
+        std::fs::write(&path, &png).unwrap();
+        assert_eq!(dimensions(&path).unwrap(), (2, 1));
+        assert!(load_any(&path).is_err());
+        assert!(crate::media::decode_image(&path).is_err());
+        for image_format in [2, 13] {
+            let mut fixture = Fixture::new(0, 2, 1);
+            fixture.packed_mip(image_format, 2, 1, &png);
+            fixture.rejects("invalid packed TEX base image");
+        }
     }
 
     #[test]
@@ -700,11 +774,18 @@ mod tests {
             (12, 15, "mip 1 decoded length"),
             (16, u32::MAX, "TEX mip 1 payload"),
         ] {
-            let mut fixture = Fixture::new(4, 8, 4);
-            fixture.mip(8, 4, 0, &red_bc3(255).repeat(2));
-            fixture.mip(4, 2, 1, &red_bc3(255));
-            fixture.word(fixture.records[1] + field, value);
-            fixture.rejects(reason);
+            for packed in [false, true] {
+                let mut fixture = Fixture::new(if packed { 0 } else { 4 }, 8, 4);
+                if packed {
+                    fixture.packed_mip(13, 8, 4, b"invalid base image");
+                    fixture.packed_mip(13, 4, 2, b"unused mip");
+                } else {
+                    fixture.mip(8, 4, 0, &red_bc3(255).repeat(2));
+                    fixture.mip(4, 2, 1, &red_bc3(255));
+                }
+                fixture.word(fixture.records[1] + field, value);
+                fixture.rejects(reason);
+            }
         }
     }
 

@@ -517,7 +517,8 @@ pub fn load(
                     .context("scene texture total overflow")?;
                 ensure!(
                     rgba_total <= MAX_TEXTURE_RGBA_TOTAL,
-                    "scene textures exceed 64 MiB decoded budget"
+                    "scene textures exceed {} MiB decoded budget",
+                    MAX_TEXTURE_RGBA_TOTAL / (1024 * 1024)
                 );
                 textures.push(Some(texture));
             }
@@ -537,11 +538,11 @@ pub fn load(
     for layer in &spec.profile.layers {
         let count = layer.material.texture_count();
         let slice = textures
-            .get(texture_index..texture_index + count)
+            .get_mut(texture_index..texture_index + count)
             .context("scene texture budget miscounted its layers")?;
         texture_index += count;
         if slice.iter().all(Option::is_some) {
-            let owned = slice.iter().flatten().cloned().collect();
+            let owned = slice.iter_mut().filter_map(Option::take).collect();
             layers.push(LayerRuntime {
                 geometry: LayerGeometry {
                     center: layer.center,

@@ -65,6 +65,104 @@ fn direct_scene_json_decodes_without_a_manifest_or_helpers() {
 }
 
 #[test]
+fn rejected_packed_texture_skips_only_its_layer_without_realigning_other_textures() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    scene_fixture(root);
+    let scene_path = root.join("scene.json");
+    let mut scene: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scene_path).unwrap()).unwrap();
+    let mut before = scene["objects"][0].clone();
+    before["name"] = serde_json::json!("before");
+    let mut broken = before.clone();
+    broken["id"] = serde_json::json!(2);
+    broken["name"] = serde_json::json!("broken");
+    broken["image"] = serde_json::json!("models/broken.json");
+    let mut after = before.clone();
+    after["id"] = serde_json::json!(3);
+    after["name"] = serde_json::json!("after");
+    scene["objects"] = serde_json::json!([before, broken, after]);
+    fs::write(&scene_path, serde_json::to_vec(&scene).unwrap()).unwrap();
+    fs::write(
+        root.join("models/broken.json"),
+        r#"{"height":2,"width":2,"material":"materials/broken.json"}"#,
+    )
+    .unwrap();
+    // One valid and one rejected texture exercise a partly decoded material.
+    fs::write(root.join("materials/broken.json"), r#"{"passes":[{"shader":"swayimage","depthtest":"disabled","depthwrite":"disabled","textures":["pixel","broken"],"constantshadervalues":{"Speed":1,"Amount":1}}]}"#).unwrap();
+    let mut png = Vec::new();
+    RgbaImage::new(2, 1)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let mut texture = Vec::from(b"TEXV0005\0TEXI0001\0".as_slice());
+    for word in [0u32, 0, 1, 1, 1, 1, 0] {
+        texture.extend_from_slice(&word.to_le_bytes());
+    }
+    texture.extend_from_slice(b"TEXB0003\0");
+    for word in [1u32, 13, 1, 1, 1, 0, 0, png.len() as u32] {
+        texture.extend_from_slice(&word.to_le_bytes());
+    }
+    texture.extend_from_slice(&png);
+    fs::write(root.join("materials/broken.tex"), texture).unwrap();
+
+    let media = wallbreak::project::resolve(&scene_path, false).unwrap();
+    assert_eq!(media.source_path, scene_path);
+    let decoded = media.scene.unwrap();
+    assert_eq!(
+        decoded
+            .profile()
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>(),
+        ["before", "after"]
+    );
+    assert!(
+        decoded
+            .profile()
+            .limitations
+            .iter()
+            .any(|note| note.contains("broken") && note.contains("cannot be decoded"))
+    );
+    assert_eq!(
+        decoded
+            .render(2, 2, wallbreak::media::Fit::Cover, 0.0)
+            .unwrap(),
+        [160, 80, 24, 255].repeat(4)
+    );
+    let check = || {
+        Command::new(BINARY)
+            .arg("check")
+            .arg(&scene_path)
+            .args(["--width", "8", "--height", "8", "--frames", "2"])
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
+            .env("PATH", "/no-helpers")
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["decoded_frames"], 2);
+    assert_eq!(result["desktop_modified"], false);
+    assert_eq!(result["media"]["path"], scene_path.to_str().unwrap());
+    assert_eq!(result["media"]["preview_only"], false);
+
+    let pixel_path = root.join("materials/pixel.tex");
+    let mut pixel = fs::read(&pixel_path).unwrap();
+    pixel.pop();
+    fs::write(pixel_path, pixel).unwrap();
+    let output = check();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no decodable image objects"));
+}
+
+#[test]
 fn direct_scene_json_retains_project_provenance_and_explicit_preview() {
     let directory = tempfile::tempdir().unwrap();
     scene_fixture(directory.path());

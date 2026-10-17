@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
-use image::{ImageDecoder, ImageReader, RgbaImage, imageops};
+use image::{ImageReader, RgbaImage, imageops};
 
 use crate::{
     project::{Media, MediaKind},
@@ -143,27 +143,14 @@ pub fn yuv420_frame(width: u32, height: u32, bytes: Vec<u8>) -> Result<Yuv420Fra
 
 /// Decode one still image with decoder and expanded RGBA frame allocation limits.
 pub fn decode_image(path: &Path) -> Result<RgbaImage> {
-    let mut input = ImageReader::open(path)
+    let input = ImageReader::open(path)
         .context("cannot open image")?
         .with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_FRAME_BYTES as u64);
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
-    input.limits(limits.clone());
-    let mut decoder = input.into_decoder().context("image decoding failed")?;
-    let (width, height) = decoder.dimensions();
-    // Decoder limits cover the source representation, not its RGBA expansion.
-    frame_len(width, height).context("decoded RGBA image exceeds frame budget")?;
-    limits
-        .reserve(decoder.total_bytes())
-        .context("image decoding failed")?;
-    decoder
-        .set_limits(limits)
-        .context("image decoding failed")?;
-    image::DynamicImage::from_decoder(decoder)
-        .context("image decoding failed")
-        .map(|image| image.into_rgba8())
+    crate::texture::decode_rgba(input, limits, None).context("image decoding failed")
 }
 
 #[derive(Default)]
@@ -471,7 +458,7 @@ pub fn fit_image(source: &RgbaImage, width: u32, height: u32, fit: Fit) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgba;
+    use image::{ImageDecoder, Rgba};
     use std::time::Instant;
 
     #[test]
@@ -607,6 +594,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(decode_image(&path).unwrap().get_pixel(0, 0).0, rgba);
+            assert_eq!(crate::texture::load_any(&path).unwrap().rgba, rgba);
+            assert_eq!(crate::texture::dimensions(&path).unwrap(), (1, 1));
             let mut bytes = std::fs::read(&path).unwrap();
             assert!(bytes.len() < 1024);
             // Change only the PNG IHDR and its CRC; pixel data stays one pixel.
@@ -630,11 +619,30 @@ mod tests {
             assert_eq!(decoder.dimensions(), (4097, 4096));
             assert_eq!(decoder.color_type(), color);
             assert!(decoder.total_bytes() <= MAX_FRAME_BYTES as u64);
-            let error = decode_image(&path).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("64 MiB"),
-                "{color:?} must fail the RGBA budget check before reading pixels: {error:#}"
-            );
+            for result in [
+                decode_image(&path).map(|_| ()),
+                crate::texture::load_any(&path).map(|_| ()),
+                crate::texture::dimensions(&path).map(|_| ()),
+            ] {
+                let error = result.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("64 MiB"),
+                    "{color:?} must fail the RGBA budget check before reading pixels: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn still_images_keep_dimension_limits_without_restricting_scene_textures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.png");
+        for (width, height) in [(16_385, 1), (1, 16_385)] {
+            RgbaImage::new(width, height).save(&path).unwrap();
+            assert!(decode_image(&path).is_err());
+            assert_eq!(crate::texture::dimensions(&path).unwrap(), (width, height));
+            let texture = crate::texture::load_any(&path).unwrap();
+            assert_eq!((texture.width, texture.height), (width, height));
         }
     }
 

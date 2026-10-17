@@ -354,10 +354,15 @@ The CPU/SHM path has at most three shared-memory presentation buffers, one pendi
 presentation frame, and a latest-frame-only decoder slot. The reader can hold one
 additional frame while decoding. Direct-image decoding has separate 64 MiB
 decoder-allocation and RGBA-output limits. Native `.tex` files have a 64 MiB
-encoded-file limit and a 64 MiB sum-of-declared-RGBA-mip-expansions limit. Scene
-loading separately checks a 128 MiB aggregate decoded-RGBA budget; raw scene-image
-decoding can allocate before its RGBA size check. These checks are not a cap on
-transient allocations or copies. The scene CPU renderer may use up to eight
+encoded-file limit and a 64 MiB sum-of-declared-RGBA-mip-expansions limit. Raw
+scene-image files also have a 64 MiB encoded-file limit. Direct images and raw or
+packed scene images share dimension admission before pixel decoding and RGBA
+expansion; packed image dimensions must match their TEX declaration. Packed RGBA
+buffers are reused, and scene layers take ownership of their decoded textures
+instead of cloning them during binding. Scene loading separately checks a
+128 MiB aggregate decoded-RGBA budget. Decoder allocation accounting is
+best-effort; these checks are not a cap on transient allocations or copies in
+other workflows. The scene CPU renderer may use up to eight
 threads; high-resolution scenes can therefore use substantial sustained CPU. GPU
 textures, mipmaps, driver allocations, and GNOME clone surfaces add memory beyond
 these CPU budgets; they are not a VRAM or total-process memory cap. FFmpeg has a
@@ -365,6 +370,29 @@ these CPU budgets; they are not a VRAM or total-process memory cap. FFmpeg has a
 cap. It may access local files but network protocols are disabled. This is not a
 sandbox for untrusted media; decoder internals, total CPU/memory usage, and
 4K/60-fps performance are not bounded or benchmarked here.
+
+### Scene-Loading Measurement
+
+A synthetic `wallbreak inspect PROJECT` workload with three distinct 2048x2048
+RGBA PNG textures (48 MiB decoded) compared baseline `d8f2e5a` with the bounded
+loader and texture-ownership changes. Both used Rust 1.88.0, debug builds with
+`--features gui`, x86_64 Linux, and GNU Time 1.10. Four fresh CLI processes ran
+serially per version; repeats below are the columnwise medians of the final
+three processes. Filesystem caches were uncontrolled, so neither first run is
+a true cold-cache measurement.
+
+| Version / Process | Elapsed (s) | User CPU (s) | System CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Before / first recorded | 0.59 | 0.51 | 0.07 | 110432 |
+| Before / repeats median | 0.59 | 0.52 | 0.06 | 110940 |
+| After / first recorded | 0.57 | 0.53 | 0.03 | 61468 |
+| After / repeats median | 0.50 | 0.46 | 0.03 | 61464 |
+
+The repeated-run median peak RSS decreased by 44.6% for this fixture. All runs
+retained the same three layers and texture bindings. `inspect` starts no decoder
+children or renderer here: GPU memory, rendering, packed TEX workloads, and
+process-family costs of playback were not measured. This is not a CPU/GPU
+rendering-performance comparison or a 4K/60-fps claim.
 
 ## TODO
 
@@ -379,8 +407,8 @@ sandbox for untrusted media; decoder internals, total CPU/memory usage, and
 - [ ] Define and test behavior for untagged/incorrect video color metadata, HDR
   transfer functions/color primaries, and chroma positioning; matrix/range
   normalization alone is not full color management.
-- [ ] Check RGBA expansion before decoding raw/packed scene images and reduce
-  transient texture copies during scene loading.
+- [x] Check RGBA expansion before decoding raw/packed scene images and remove
+  redundant packed-image and layer-binding texture copies.
 - [ ] Measure equivalent CPU/GPU scene and video workloads: CPU time, CPU/GPU
   frame time, and peak process-family/GPU memory, including FFmpeg and GNOME clones.
   Record resolution, FPS, driver, and cold/warm runs before making performance
