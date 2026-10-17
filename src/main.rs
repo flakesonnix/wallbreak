@@ -1,13 +1,13 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use wallbreak::{
     display, gnome, log, log_debug, log_info,
@@ -235,7 +235,7 @@ fn run(command: Action) -> Result<()> {
                         Err(cleanup) => {
                             error.context(format!("decoder cleanup also failed: {cleanup:#}"))
                         }
-                    })
+                    });
                 }
             };
             cleanup?;

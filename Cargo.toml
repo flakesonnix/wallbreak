@@ -1,8 +1,7 @@
 [package]
 name = "wallbreak"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
 authors = ["flakesonnix"]
 description = "Experimental image/video and layered-scene wallpaper player for Wayland"
 homepage = "https://github.com/flakesonnix/wallbreak"

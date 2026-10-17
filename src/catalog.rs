@@ -6,10 +6,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::{
-    project::{self, file_kind, MediaKind},
+    project::{self, MediaKind, file_kind},
     scene,
     steam::{self, ProjectEntry},
 };
@@ -167,7 +167,8 @@ fn local_entry(path: &Path) -> Result<Option<ProjectEntry>> {
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).with_context(|| format!("cannot inspect {}", manifest.display()))
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {}", manifest.display()));
             }
         }
         let scene_path = path.join("scene.json");
@@ -176,7 +177,7 @@ fn local_entry(path: &Path) -> Result<Option<ProjectEntry>> {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("cannot inspect {}", scene_path.display()))
+                    .with_context(|| format!("cannot inspect {}", scene_path.display()));
             }
         }
         path = scene_path

@@ -7,13 +7,13 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use glow::HasContext;
 use image::RgbaImage;
 
 use crate::{
-    media::{yuv420_len, Fit, Yuv420Frame},
-    scene::{scene_layout, Blending, LayerGeometry, MaterialRuntime, Scene, SceneLayout},
+    media::{Fit, Yuv420Frame, yuv420_len},
+    scene::{Blending, LayerGeometry, MaterialRuntime, Scene, SceneLayout, scene_layout},
     texture::Texture,
 };
 

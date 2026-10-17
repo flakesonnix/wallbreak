@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 
@@ -191,7 +191,7 @@ fn read_settings(path: &Path) -> Result<Option<(Vec<u8>, LibrarySettings)>> {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error).with_context(|| format!("cannot open settings {}", path.display()))
+            return Err(error).with_context(|| format!("cannot open settings {}", path.display()));
         }
     };
     let metadata = file
@@ -246,7 +246,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("cannot create temporary settings {}", temporary.display())
-                })
+                });
             }
         };
         let result = (|| -> Result<()> {

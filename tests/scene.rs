@@ -46,11 +46,13 @@ fn render_for_similarity(
     for time in [0.0, 0.25, 0.5, 0.75, 1.0, 1.5] {
         let rendered = frame.render_frame(time).unwrap();
         assert_eq!(rendered.len(), (width * height * 4) as usize);
-        assert!(rendered
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|pixel| pixel[3] == 255));
+        assert!(
+            rendered
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255)
+        );
         if first.is_none() {
             first = Some(rendered.clone());
         }

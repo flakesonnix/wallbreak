@@ -11,7 +11,7 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::project::open_regular_file;
 
@@ -57,7 +57,7 @@ pub(crate) fn scene_source(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("cannot inspect packed scene {}", pkg_path.display()))
+                .with_context(|| format!("cannot inspect packed scene {}", pkg_path.display()));
         }
     };
     ensure!(
@@ -431,9 +431,11 @@ mod tests {
             fs::read(cache.join("materials/a.tex")).unwrap(),
             b"TEXV0005\x00"
         );
-        assert!(!cache
-            .with_extension(format!("staging{}", std::process::id()))
-            .exists());
+        assert!(
+            !cache
+                .with_extension(format!("staging{}", std::process::id()))
+                .exists()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

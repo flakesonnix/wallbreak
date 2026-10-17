@@ -17,13 +17,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    media::{frame_len, Fit},
+    media::{Fit, frame_len},
     project::open_regular_file,
-    texture::{load_any as load_texture, Texture},
+    texture::{Texture, load_any as load_texture},
 };
 
 const MAX_SCENE_BYTES: u64 = 4 * 1024 * 1024;
@@ -1963,11 +1963,13 @@ mod tests {
         let scene =
             mutate(&|document| document["general"]["bloom"] = serde_json::Value::Bool(true))
                 .unwrap();
-        assert!(scene
-            .profile
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("Bloom")));
+        assert!(
+            scene
+                .profile
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("Bloom"))
+        );
         let error = mutate(&|document| {
             document["objects"][0]["image"] =
                 serde_json::Value::String("models/missing.json".into())
@@ -1990,11 +1992,13 @@ mod tests {
             mutate(&|document| document["objects"][0]["visible"] = serde_json::Value::Bool(false))
                 .unwrap();
         assert_eq!(scene.profile.layers.len(), 0);
-        assert!(scene
-            .profile
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("invisible")));
+        assert!(
+            scene
+                .profile
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("invisible"))
+        );
     }
 
     #[test]

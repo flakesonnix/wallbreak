@@ -9,21 +9,21 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use eframe::{egui, egui_glow, glow};
 
 use crate::{
     gpu::{Clock, GpuImage, GpuScene, GpuVideo, Renderer},
-    media::{decode_image, frame_len, Fit, Frame, MediaWorker, PlaybackOptions, Yuv420Frame},
+    media::{Fit, Frame, MediaWorker, PlaybackOptions, Yuv420Frame, decode_image, frame_len},
     project,
     scene::Scene,
 };
@@ -730,11 +730,12 @@ mod tests {
         args.logical_width = 4;
         args.logical_height = 2;
         args.source = "project.json".into();
-        assert!(args
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("absolute"));
+        assert!(
+            args.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
     }
 
     fn image_app() -> (tempfile::TempDir, Animation, Rc<RefCell<Result<()>>>) {
@@ -787,9 +788,11 @@ mod tests {
         assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::ZERO);
         app.close.store(true, Ordering::Relaxed);
         let output = ctx.run(Default::default(), |ctx| app.show(ctx).unwrap());
-        assert!(output.viewport_output[&egui::ViewportId::ROOT]
-            .commands
-            .contains(&egui::ViewportCommand::Close));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
         drop(app);
         outcome.replace(Ok(())).unwrap();
     }
@@ -802,15 +805,19 @@ mod tests {
         *app.gpu_error.lock().unwrap() = Some("scene draw failed: test".into());
         let ctx = egui::Context::default();
         let output = ctx.run(Default::default(), |ctx| app.tick(ctx));
-        assert!(output.viewport_output[&egui::ViewportId::ROOT]
-            .commands
-            .contains(&egui::ViewportCommand::Close));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
         drop(app);
-        assert!(outcome
-            .replace(Ok(()))
-            .unwrap_err()
-            .to_string()
-            .contains("scene draw failed: test"));
+        assert!(
+            outcome
+                .replace(Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("scene draw failed: test")
+        );
     }
 
     #[test]
@@ -854,11 +861,13 @@ mod tests {
             Animation::start(args(), Arc::new(AtomicBool::new(false)), outcome.clone()).unwrap();
         app.ready.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(app);
-        assert!(outcome
-            .replace(Ok(()))
-            .unwrap_err()
-            .to_string()
-            .contains("regular media file"));
+        assert!(
+            outcome
+                .replace(Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("regular media file")
+        );
     }
 
     #[test]
@@ -895,11 +904,13 @@ mod tests {
             "{error:#}"
         );
         drop(app);
-        assert!(outcome
-            .replace(Ok(()))
-            .unwrap_err()
-            .to_string()
-            .contains("missing-ffmpeg-binary"));
+        assert!(
+            outcome
+                .replace(Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("missing-ffmpeg-binary")
+        );
     }
 
     #[test]

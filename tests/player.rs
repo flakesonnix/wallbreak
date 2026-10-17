@@ -5,8 +5,8 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -149,9 +149,11 @@ fn unresponsive_child_is_escalated_and_reaped_with_a_warning() {
     assert!(start.elapsed() >= Duration::from_secs(2));
     assert!(start.elapsed() < Duration::from_secs(5));
     assert_eq!(player.exit_status().unwrap().signal(), Some(9));
-    assert!(player
-        .diagnostics()
-        .contains("restoration may not have completed"));
+    assert!(
+        player
+            .diagnostics()
+            .contains("restoration may not have completed")
+    );
     assert!(!marker.exists());
     assert!(!player.has_pending_work());
 }

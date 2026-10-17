@@ -3,7 +3,7 @@
 
 use std::{fs::File, io::Read, path::Path};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RGBA_BYTES: usize = 64 * 1024 * 1024;
@@ -661,10 +661,12 @@ mod tests {
 
     #[test]
     fn rejects_encoded_file_budget_in_memory() {
-        assert!(decode(&vec![0; MAX_FILE_BYTES + 1])
-            .unwrap_err()
-            .to_string()
-            .contains("encoded TEX exceeds"));
+        assert!(
+            decode(&vec![0; MAX_FILE_BYTES + 1])
+                .unwrap_err()
+                .to_string()
+                .contains("encoded TEX exceeds")
+        );
     }
 
     #[test]

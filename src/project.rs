@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -259,9 +259,12 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
         )
     } else if let Some(project) = &project {
         match project.resolved_kind() {
-            Some(ProjectKind::Scene) | Some(ProjectKind::Video) | Some(ProjectKind::Image) => {
-                Some(project.file.clone().context("project has no file declaration")?)
-            }
+            Some(ProjectKind::Scene) | Some(ProjectKind::Video) | Some(ProjectKind::Image) => Some(
+                project
+                    .file
+                    .clone()
+                    .context("project has no file declaration")?,
+            ),
             Some(ProjectKind::Web) => bail!(
                 "project is a web wallpaper: rendering its page requires a browser engine; use --preview for the static preview"
             ),
@@ -360,7 +363,7 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
 }
 
 pub(crate) fn open_regular_file(path: &Path) -> Result<File> {
-    use rustix::fs::{open, Mode, OFlags};
+    use rustix::fs::{Mode, OFlags, open};
 
     // Nonblocking open lets us inspect and reject FIFOs before any read.
     let file = File::from(
@@ -501,10 +504,12 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("preview.jpg"), b"preview").unwrap();
-        assert!(resolve(dir.path(), false)
-            .unwrap_err()
-            .to_string()
-            .contains("invalid scene model"));
+        assert!(
+            resolve(dir.path(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid scene model")
+        );
         let selected = resolve(dir.path(), true).unwrap();
         assert!(selected.preview_only);
         assert_eq!(selected.declared_file.as_deref(), Some("preview.jpg"));
@@ -526,10 +531,12 @@ mod tests {
         let selected = resolve(dir.path(), false).unwrap();
         assert_eq!(selected.kind, MediaKind::Video);
         project(dir.path(), r#"{"file":"mystery.bin"}"#);
-        assert!(resolve(dir.path(), false)
-            .unwrap_err()
-            .to_string()
-            .contains("unknown"));
+        assert!(
+            resolve(dir.path(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
         project(dir.path(), r#"{"type":"video","file":"missing.mp4"}"#);
         assert!(resolve(dir.path(), false).is_err());
     }
@@ -547,10 +554,12 @@ mod tests {
         project(dir.path(), "{");
         assert!(resolve(dir.path(), false).is_err());
         project(dir.path(), &" ".repeat(MAX_PROJECT_BYTES as usize + 1));
-        assert!(resolve(dir.path(), false)
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds"));
+        assert!(
+            resolve(dir.path(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
     }
 
     #[cfg(unix)]
@@ -562,9 +571,11 @@ mod tests {
         fs::write(&video, b"video").unwrap();
         std::os::unix::fs::symlink(video, dir.path().join("clip.mp4")).unwrap();
         project(dir.path(), r#"{"type":"video","file":"clip.mp4"}"#);
-        assert!(resolve(dir.path(), false)
-            .unwrap_err()
-            .to_string()
-            .contains("outside"));
+        assert!(
+            resolve(dir.path(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
     }
 }

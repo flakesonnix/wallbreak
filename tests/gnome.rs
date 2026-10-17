@@ -12,7 +12,7 @@ use std::{
 };
 
 use image::{Rgba, RgbaImage};
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_wallbreak");
 const SCHEMA: &str = "org.gnome.desktop.background";

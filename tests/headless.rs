@@ -11,7 +11,7 @@ use std::{
 };
 
 use image::{Rgba, RgbaImage};
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_wallbreak");
 
@@ -330,5 +330,7 @@ fn presents_image_and_video_resizes_and_stops_in_isolated_sway() {
             "scene surface was not removed after stop"
         );
     }
-    eprintln!("verified: outputs, image pixels, changing video, resize, scale, duration, SIGTERM and unmap in isolated Sway");
+    eprintln!(
+        "verified: outputs, image pixels, changing video, resize, scale, duration, SIGTERM and unmap in isolated Sway"
+    );
 }

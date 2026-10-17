@@ -9,8 +9,8 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicU8, Ordering},
         OnceLock,
+        atomic::{AtomicU8, Ordering},
     },
     time::Instant,
 };

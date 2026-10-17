@@ -3,15 +3,15 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure, Context, Result};
-use zbus::blocking::{connection, fdo::DBusProxy, Connection};
+use anyhow::{Context, Result, bail, ensure};
+use zbus::blocking::{Connection, connection, fdo::DBusProxy};
 
 use crate::{
     media::{Fit, PlaybackOptions},

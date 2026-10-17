@@ -1,12 +1,12 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, SurfaceData},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -15,25 +15,25 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::{
+        WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
-        WaylandSurface,
     },
     shm::{
-        slot::{Buffer, SlotPool},
         Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
     },
 };
 use wayland_client::{
+    Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_output, wl_region, wl_shm, wl_surface},
-    Connection, Proxy, QueueHandle,
 };
 
 use crate::{
-    media::{frame_len, MediaWorker, PlaybackOptions},
+    media::{MediaWorker, PlaybackOptions, frame_len},
     project::{Media, MediaKind},
 };
 

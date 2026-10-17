@@ -3,16 +3,16 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
-use image::{imageops, ImageDecoder, ImageReader, RgbaImage};
+use image::{ImageDecoder, ImageReader, RgbaImage, imageops};
 
 use crate::{
     project::{Media, MediaKind},
@@ -397,8 +397,12 @@ fn video_filter(width: u32, height: u32, options: &PlaybackOptions, format: Fram
         FrameFormat::Yuv420 => ":out_color_matrix=bt709:out_range=tv",
     };
     match options.fit {
-        Fit::Cover => format!("fps={fps},crop=w='max(1,min(iw,ih*{width}/{height}))':h='max(1,min(ih,iw*{height}/{width}))':exact=1,scale={width}:{height}{color},setsar=1"),
-        Fit::Contain => format!("fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease{color},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"),
+        Fit::Cover => format!(
+            "fps={fps},crop=w='max(1,min(iw,ih*{width}/{height}))':h='max(1,min(ih,iw*{height}/{width}))':exact=1,scale={width}:{height}{color},setsar=1"
+        ),
+        Fit::Contain => format!(
+            "fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease{color},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+        ),
     }
 }
 
@@ -514,9 +518,19 @@ mod tests {
             (FrameFormat::Yuv420, ":out_color_matrix=bt709:out_range=tv"),
         ] {
             let cover = video_filter(1920, 1080, &options(Fit::Cover), format);
-            assert_eq!(cover, format!("fps=24,crop=w='max(1,min(iw,ih*1920/1080))':h='max(1,min(ih,iw*1080/1920))':exact=1,scale=1920:1080{color},setsar=1"));
+            assert_eq!(
+                cover,
+                format!(
+                    "fps=24,crop=w='max(1,min(iw,ih*1920/1080))':h='max(1,min(ih,iw*1080/1920))':exact=1,scale=1920:1080{color},setsar=1"
+                )
+            );
             let contain = video_filter(1920, 1080, &options(Fit::Contain), format);
-            assert_eq!(contain, format!("fps=24,scale=1920:1080:force_original_aspect_ratio=decrease{color},pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"));
+            assert_eq!(
+                contain,
+                format!(
+                    "fps=24,scale=1920:1080:force_original_aspect_ratio=decrease{color},pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+                )
+            );
         }
     }
 

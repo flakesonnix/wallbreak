@@ -13,7 +13,7 @@ mod tests {
         io::{BufRead, BufReader},
         os::unix::ffi::OsStringExt,
         process::{Child, Command, Stdio},
-        sync::{mpsc, Mutex},
+        sync::{Mutex, mpsc},
     };
 
     const OBJECT: &str = "/io/github/flakesonnix/Wallbreak";
@@ -339,10 +339,12 @@ mod tests {
                 state.stopped.is_some(),
                 "controller must await stopped, not just Stop reply"
             );
-            assert!(state
-                .sessions
-                .iter()
-                .all(|session| session == &state.session));
+            assert!(
+                state
+                    .sessions
+                    .iter()
+                    .all(|session| session == &state.session)
+            );
             let sender = zbus::names::BusName::try_from(state.senders[0].as_str()).unwrap();
             let bus = DBusProxy::new(&self.service).unwrap();
             let deadline = Instant::now() + CALL_TIMEOUT;
@@ -381,9 +383,11 @@ mod tests {
         assert!(fixture.state.lock().unwrap().starts.is_empty());
         fixture.service.release_name(SERVICE).unwrap();
         let error = fixture.run(&options(), None, cancelled()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("installation/activation are not automatic"));
+        assert!(
+            error
+                .to_string()
+                .contains("installation/activation are not automatic")
+        );
         assert!(fixture.state.lock().unwrap().starts.is_empty());
     }
 
@@ -516,9 +520,11 @@ mod tests {
         });
         let started = Instant::now();
         let error = fixture.run(&options(), None, cancelled()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("cleanup unknown because no session identifier"));
+        assert!(
+            error
+                .to_string()
+                .contains("cleanup unknown because no session identifier")
+        );
         assert!(started.elapsed() < Duration::from_secs(3));
         let state = fixture.state.lock().unwrap();
         assert_eq!(state.stops, 0, "no token exists to address Stop");
@@ -598,9 +604,11 @@ mod tests {
         });
         let started = Instant::now();
         let error = fixture.run(&options(), None, cancelled()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("did not reach running within 25 seconds"));
+        assert!(
+            error
+                .to_string()
+                .contains("did not reach running within 25 seconds")
+        );
         assert!(started.elapsed() < START_TIMEOUT + Duration::from_secs(1));
         fixture.assert_cleaned();
     }
@@ -688,11 +696,13 @@ mod tests {
         for fps in [0, 61, u32::MAX] {
             let mut options = options();
             options.fps = fps;
-            assert!(fixture
-                .run(&options, None, cancelled())
-                .unwrap_err()
-                .to_string()
-                .contains("FPS"));
+            assert!(
+                fixture
+                    .run(&options, None, cancelled())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("FPS")
+            );
         }
         let renderer = fixture.renderer.clone();
         for path in [
@@ -709,26 +719,32 @@ mod tests {
         fixture.renderer = renderer;
         let mut bad_options = options();
         bad_options.ffmpeg = std::ffi::OsString::from_vec(vec![0xff]).into();
-        assert!(fixture
-            .run(&bad_options, None, cancelled())
-            .unwrap_err()
-            .to_string()
-            .contains("FFmpeg path is not UTF-8"));
+        assert!(
+            fixture
+                .run(&bad_options, None, cancelled())
+                .unwrap_err()
+                .to_string()
+                .contains("FFmpeg path is not UTF-8")
+        );
         fixture.media.source_path = fixture
             ._directory
             .path()
             .join(std::ffi::OsString::from_vec(vec![0xff]));
-        assert!(fixture
-            .run(&options(), None, cancelled())
-            .unwrap_err()
-            .to_string()
-            .contains("source path is not UTF-8"));
+        assert!(
+            fixture
+                .run(&options(), None, cancelled())
+                .unwrap_err()
+                .to_string()
+                .contains("source path is not UTF-8")
+        );
         fixture.media.preview_only = true;
-        assert!(fixture
-            .run(&options(), None, cancelled())
-            .unwrap_err()
-            .to_string()
-            .contains("static preview"));
+        assert!(
+            fixture
+                .run(&options(), None, cancelled())
+                .unwrap_err()
+                .to_string()
+                .contains("static preview")
+        );
         assert!(fixture.state.lock().unwrap().starts.is_empty());
         // Already-cancelled public playback must not connect to any ambient bus.
         run(

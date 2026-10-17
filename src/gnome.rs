@@ -7,17 +7,17 @@ use std::{
     path::Path,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure, Context, Result};
-use rustix::fs::{flock, FlockOperation, OFlags};
+use anyhow::{Context, Result, bail, ensure};
+use rustix::fs::{FlockOperation, OFlags, flock};
 
 use crate::{
-    media::{Fit, PlaybackOptions, MAX_FRAME_BYTES},
+    media::{Fit, MAX_FRAME_BYTES, PlaybackOptions},
     project::{Media, MediaKind},
 };
 
@@ -46,7 +46,10 @@ pub fn run(
     if media.kind != MediaKind::Image {
         return crate::gnome_bridge::run(media, options, output, stop);
     }
-    ensure!(output.is_none(), "GNOME image playback applies to all displays; omit --output instead of selecting one monitor.");
+    ensure!(
+        output.is_none(),
+        "GNOME image playback applies to all displays; omit --output instead of selecting one monitor."
+    );
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -68,7 +71,9 @@ pub fn run(
     };
     let _lock = playback_lock()?;
     let mut background = Background::apply(uri.as_str(), mode)?;
-    eprintln!("GNOME static image active on all displays. Stop restores settings still owned by wallbreak.");
+    eprintln!(
+        "GNOME static image active on all displays. Stop restores settings still owned by wallbreak."
+    );
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed)
         && options

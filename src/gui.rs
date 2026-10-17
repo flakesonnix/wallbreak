@@ -9,15 +9,15 @@ use std::{
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 
 use crate::{
     display,
@@ -224,7 +224,7 @@ impl Player {
                     match kill_process(pid, Signal::KILL) {
                         Ok(()) | Err(rustix::io::Errno::SRCH) => {}
                         Err(error) => {
-                            return Err(error).context("cannot send KILL to wallpaper process")
+                            return Err(error).context("cannot send KILL to wallpaper process");
                         }
                     }
                     self.forced = true;
@@ -430,17 +430,21 @@ mod tests {
         rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()).unwrap();
         let mut player = Player::new();
         player.child = Some(child);
-        assert!(player
-            .is_running()
-            .unwrap_err()
-            .to_string()
-            .contains("poll"));
+        assert!(
+            player
+                .is_running()
+                .unwrap_err()
+                .to_string()
+                .contains("poll")
+        );
         assert!(player.has_pending_work());
         assert!(player.stop().is_err());
         assert_eq!(Pid::from_child(player.child.as_ref().unwrap()), pid);
-        assert!(player
-            .start(&PathBuf::from("must-not-run"), &[], "new".into())
-            .is_err());
+        assert!(
+            player
+                .start(&PathBuf::from("must-not-run"), &[], "new".into())
+                .is_err()
+        );
         assert_eq!(Pid::from_child(player.child.as_ref().unwrap()), pid);
         assert!(player.exit_status().is_none());
     }

@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_wallbreak-renderer");
 
