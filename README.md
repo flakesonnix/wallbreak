@@ -402,6 +402,18 @@ and the extension archive required for GNOME animation. It also does not bundle
 FFmpeg or the GUI's OpenGL/Wayland runtime libraries; prefer the Nix flake for a
 complete installation.
 
+## Project Page
+
+The standalone project page lives in [site/index.html](site/index.html). Open it
+directly in a browser, or serve it with `python3 -m http.server 8000 --directory site`.
+It has no build step or external assets.
+
+The `project page` workflow validates the HTML on relevant pull requests and
+pushes, then publishes `site/` to GitHub Pages from `main`. To enable publishing,
+select **GitHub Actions** under **Settings > Pages > Build and deployment > Source**.
+The published URL is <https://flakesonnix.github.io/wallbreak/>. A manual workflow
+run is also available after enabling Pages.
+
 ## License
 
 MIT; see [LICENSE](LICENSE).

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Wallbreak is an independent, experimental Rust wallpaper player for Linux Wayland. Play images, videos, and supported layered scenes.">
+  <meta name="theme-color" content="#f3f0e7">
+  <title>Wallbreak | Beyond a still desktop</title>
+  <style>
+    :root { color-scheme: light; --paper: #f3f0e7; --ink: #203b32; --muted: #53645a; --line: #c7cdc0; --accent: #d9ed89; }
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 2rem; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 1rem/1.65 system-ui, sans-serif; }
+    a { color: inherit; text-underline-offset: .25em; }
+    a:hover { text-decoration-thickness: 2px; }
+    a:focus-visible { outline: 3px solid currentColor; outline-offset: 5px; }
+    .wrap { width: min(1120px, calc(100% - 3rem)); margin-inline: auto; }
+    .skip { position: absolute; top: -5rem; left: 1rem; padding: .5rem 1rem; background: var(--accent); z-index: 2; }
+    .skip:focus { top: 1rem; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 1.75rem; border-bottom: 1px solid var(--line); }
+    .brand { font-size: 1.35rem; font-weight: 800; letter-spacing: -.06em; text-decoration: none; }
+    .brand span { display: inline-block; width: .7rem; height: .7rem; margin-right: .5rem; background: var(--ink); box-shadow: 4px -4px 0 #92a86b; }
+    nav { display: flex; flex-wrap: wrap; gap: 1.5rem; font-size: .875rem; }
+    nav a { text-decoration: none; }
+    .eyebrow { margin: 0 0 1.5rem; font: .75rem/1.5 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .13em; }
+    .hero { padding-block: 4.5rem 3rem; }
+    .intro { display: grid; grid-template-columns: 1.5fr 1fr; align-items: end; gap: 3rem; margin-bottom: 3rem; }
+    h1 { margin: 0; font: clamp(3.25rem, 6.5vw, 5.5rem)/1.05 Georgia, "Times New Roman", "DejaVu Serif", serif; letter-spacing: -.055em; }
+    h1 em { font-weight: normal; }
+    .intro p { max-width: 35ch; margin: 0 0 1.5rem; color: var(--muted); }
+    .button { display: inline-block; padding: .8rem 1.25rem; background: var(--ink); color: var(--paper); text-decoration: none; font-size: .9rem; }
+    .button:hover { background: #305444; }
+    figure { margin: 0; }
+    .landscape { position: relative; overflow: hidden; background: #bccdb5; border: 1px solid #a6b8a1; }
+    .landscape svg { display: block; width: 100%; height: auto; }
+    .desktop-label { position: absolute; left: 1.25rem; top: 1.25rem; padding: .35rem .7rem; background: var(--paper); font: .7rem/1.5 ui-monospace, monospace; }
+    .desktop-label::before { content: ""; display: inline-block; width: .45rem; height: .45rem; border-radius: 50%; background: #446044; margin-right: .5rem; }
+    figcaption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem 1.5rem; margin-top: .65rem; color: var(--muted); font: .75rem/1.5 ui-monospace, monospace; }
+    .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.5rem; padding-block: 1rem 4rem; }
+    .feature { border-top: 1px solid var(--line); padding-top: 1rem; }
+    .number { font: .75rem/1.5 ui-monospace, monospace; color: var(--muted); }
+    h2 { margin: 0 0 1rem; font: 2.5rem/1.15 Georgia, "Times New Roman", "DejaVu Serif", serif; letter-spacing: -.035em; }
+    .feature h2 { margin: .8rem 0 .5rem; font: 700 1.1rem/1.5 system-ui, sans-serif; letter-spacing: normal; }
+    .feature p { margin: 0; color: var(--muted); font-size: .925rem; }
+    .install { display: grid; grid-template-columns: 1fr 1.2fr; gap: 3rem; padding: 3rem; background: var(--ink); color: var(--paper); }
+    .install .eyebrow { color: var(--accent); }
+    .install p { margin: 0; max-width: 36ch; }
+    .commands { min-width: 0; }
+    .commands p { font-size: .8rem; }
+    pre { margin: .5rem 0 1.5rem; padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #6e8273; background: #172e25; color: var(--accent); font-size: .85rem; }
+    code { font-family: ui-monospace, monospace; }
+    .commands > a { font-size: .875rem; }
+    .compatibility { display: grid; grid-template-columns: 1fr 1.2fr; gap: 3rem; padding-block: 4rem; }
+    .compatibility p { color: var(--muted); max-width: 38ch; }
+    dl { margin: 0; }
+    dl > div { padding-block: 1rem; border-top: 1px solid var(--line); }
+    dt { font-weight: 650; }
+    dd { margin: .3rem 0 0; color: var(--muted); font-size: .9rem; }
+    footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem; border-top: 1px solid var(--line); padding-block: 1.5rem 2rem; font-size: .8rem; color: var(--muted); }
+    footer p { margin: 0; }
+    @media (max-width: 720px) {
+      .intro, .install, .compatibility { grid-template-columns: 1fr; gap: 2rem; }
+      .hero { padding-top: 3rem; }
+      .intro p { max-width: 48ch; }
+      .features { grid-template-columns: 1fr; gap: 1.5rem; padding-bottom: 3rem; }
+      .install { padding: 1.75rem; }
+      .compatibility { padding-block: 3rem; }
+    }
+    @media (max-width: 400px) {
+      .wrap { width: calc(100% - 2rem); }
+      nav { gap: 1rem; }
+      .install { padding: 1.25rem; }
+      .desktop-label { top: .75rem; left: .75rem; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="wrap">
+    <a class="brand" href="#main" aria-label="Wallbreak home"><span aria-hidden="true"></span>wallbreak</a>
+    <nav aria-label="Main navigation">
+      <a href="#install">Get started</a>
+      <a href="https://github.com/flakesonnix/wallbreak">GitHub &nearr;</a>
+    </nav>
+  </header>
+
+  <main id="main" class="wrap">
+    <section class="hero" aria-labelledby="headline">
+      <p class="eyebrow">Linux / Wayland / Made with Rust</p>
+      <div class="intro">
+        <h1 id="headline">Your desktop.<br><em>A little less still.</em></h1>
+        <div>
+          <p>An independent, experimental wallpaper player for images, videos, and supported layered scenes. A background that feels like yours.</p>
+          <a class="button" href="#install">Try wallbreak &rarr;</a>
+        </div>
+      </div>
+      <figure>
+        <div class="landscape">
+          <span class="desktop-label">eDP-1 / a different point of view</span>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 390" aria-hidden="true" focusable="false">
+            <rect width="1120" height="390" fill="#bccdb5"/>
+            <circle cx="835" cy="116" r="63" fill="#f1df9d"/>
+            <path d="M0 240 180 154 310 212 503 90 700 224 860 161 1120 224V390H0Z" fill="#92ab94"/>
+            <path d="m0 300 244-113 191 89 244-133 226 122 215-72v197H0Z" fill="#617e69"/>
+            <path d="M0 332c199-102 300 85 526-22s372-50 594 9v71H0Z" fill="#365c4b"/>
+            <path d="M0 390c244-103 361 68 600-10s361-56 520-6v16Z" fill="#203b32"/>
+            <path d="M496 390c24-54 168-58 159-87s-99-12-88-39 85-31 102-48" fill="none" stroke="#d9d8aa" stroke-width="3" opacity=".8"/>
+          </svg>
+        </div>
+        <figcaption><span>A small player. A wider view.</span><span>Original illustration, not an app screenshot.</span></figcaption>
+      </figure>
+    </section>
+
+    <section class="features" aria-label="What wallbreak does">
+      <div class="feature">
+        <span class="number">01 / YOUR MEDIA</span>
+        <h2>From stills to scenes.</h2>
+        <p>Display a favorite image, loop a video without audio, or play supported layered Wallpaper Engine scenes from your local collection.</p>
+      </div>
+      <div class="feature">
+        <span class="number">02 / YOUR WORKFLOW</span>
+        <h2>A panel. Or a command.</h2>
+        <p>Browse local projects and preview media in the control panel. Prefer scripts? The CLI handles inspection, output selection, and playback.</p>
+      </div>
+      <div class="feature">
+        <span class="number">03 / YOUR DESKTOP</span>
+        <h2>Nothing takes the foreground.</h2>
+        <p>Designed for layer-shell backgrounds, with separate GNOME support. No Steam, Wine, or Wallpaper Engine executable is launched.</p>
+      </div>
+    </section>
+
+    <section id="install" class="install" aria-labelledby="install-title">
+      <div>
+        <p class="eyebrow">Start here</p>
+        <h2 id="install-title">One command.<br>A new backdrop.</h2>
+        <p>On a supported Linux desktop with Nix installed, open the control panel. The flake supplies FFmpeg and the runtime dependencies.</p>
+      </div>
+      <div class="commands">
+        <p>Launch without a checkout</p>
+        <pre><code>nix run github:flakesonnix/wallbreak</code></pre>
+        <p>Keep it in your profile</p>
+        <pre><code>nix profile install github:flakesonnix/wallbreak
+wallbreak-gui</code></pre>
+        <a href="https://github.com/flakesonnix/wallbreak#quick-start">CLI examples &amp; building without Nix &rarr;</a>
+      </div>
+    </section>
+
+    <section class="compatibility" aria-labelledby="support-title">
+      <div>
+        <p class="eyebrow">A work in progress, on purpose</p>
+        <h2 id="support-title">Know your terrain.</h2>
+        <p>Wallbreak is experimental, not a full Wallpaper Engine clone. Support depends on your compositor and the content you choose.</p>
+        <a href="https://github.com/flakesonnix/wallbreak#rendering-backends">Read the compatibility details &rarr;</a>
+      </div>
+      <dl>
+        <div>
+          <dt>Sway &amp; layer-shell</dt>
+          <dd>Images, videos, and supported scenes on Wayland compositors implementing <code>wlr-layer-shell</code>. Tested with Sway.</dd>
+        </div>
+        <div>
+          <dt>GNOME</dt>
+          <dd>Static images through <code>gsettings</code>. Video and supported scene playback require the optional GNOME 50 Shell bridge, installed and enabled separately.</dd>
+        </div>
+        <div>
+          <dt>Deliberately limited</dt>
+          <dd>No X11, web or application wallpapers, custom scene shaders, or full scene compatibility. Video decoding uses an external FFmpeg process on the CPU, not hardware decoding.</dd>
+        </div>
+      </dl>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <p>wallbreak / Independent, open source, experimental.</p>
+    <p><a href="https://github.com/flakesonnix/wallbreak/blob/main/LICENSE">MIT license</a> &middot; <a href="https://github.com/flakesonnix/wallbreak/issues">Report an issue</a></p>
+  </footer>
+</body>
+</html>
