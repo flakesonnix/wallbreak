@@ -10,7 +10,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use wallbreak::{
-    display, gnome,
+    display, gnome, log, log_debug, log_info,
     media::{Fit, MediaWorker, PlaybackOptions},
     project, steam,
 };
@@ -21,6 +21,9 @@ use wallbreak::{
     about = "Image/video and supported layered scene wallpapers for Wayland"
 )]
 struct Cli {
+    /// Increase log detail: -v info, -vv debug, -vvv trace (default warn; WALLBREAK_LOG overrides).
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
     #[command(subcommand)]
     command: Action,
 }
@@ -74,26 +77,68 @@ enum Action {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
+    let cli = Cli::parse();
+    log::init_from_env();
+    if cli.verbose > 0 {
+        log::set_level(match cli.verbose {
+            1 => log::Level::Info,
+            2 => log::Level::Debug,
+            _ => log::Level::Trace,
+        });
+    }
+    log_debug!(
+        "wallbreak {} starting (log level {:?})",
+        env!("CARGO_PKG_VERSION"),
+        log::level()
+    );
+    if let Err(error) = run(cli.command) {
+        report_error(&error);
+        std::process::exit(1);
+    }
+}
+
+/// Print the full cause chain as plain lines so terminal users see the same
+/// context a developer would read from the debug representation.
+fn report_error(error: &anyhow::Error) {
+    eprintln!("error: {error}");
+    for cause in error.chain().skip(1) {
+        eprintln!("  caused by: {cause}");
+    }
+}
+
+fn run(command: Action) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, stop.clone())?;
     }
-    match Cli::parse().command {
+    match command {
         Action::Inspect { path, preview } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&project::resolve(&path, preview)?)?
+            let media = project::resolve(&path, preview)?;
+            log_info!(
+                "resolved {} as {:?} from {}",
+                media.path.display(),
+                media.kind,
+                media.source_path.display()
             );
+            for limitation in &media.limitations {
+                log_debug!("limitation: {limitation}");
+            }
+            println!("{}", serde_json::to_string_pretty(&media)?);
         }
         Action::Outputs => println!(
             "{}",
             serde_json::to_string_pretty(&display::list_outputs()?)?,
         ),
-        Action::Projects => println!(
-            "{}",
-            serde_json::to_string_pretty(&steam::scan(&steam::default_roots()))?,
-        ),
+        Action::Projects => {
+            let entries = steam::scan(&steam::default_roots());
+            let supported = entries.iter().filter(|entry| entry.supported).count();
+            log_info!(
+                "found {} Wallpaper Engine projects, {supported} supported",
+                entries.len()
+            );
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
         Action::GnomeExtension => {
             let path = PathBuf::from(std::env::var_os("WALLBREAK_GNOME_EXTENSION_ZIP")
                 .context("GNOME extension archive not configured; use the Nix package to obtain the optional bridge")?);
@@ -117,6 +162,11 @@ fn main() -> Result<()> {
             duration_seconds,
         } => {
             let media = project::resolve(&path, preview)?;
+            log_info!(
+                "playing {} ({:?}) at {fps} fps",
+                media.path.display(),
+                media.kind
+            );
             for limitation in &media.limitations {
                 eprintln!("Note: {limitation}");
             }
@@ -141,6 +191,11 @@ fn main() -> Result<()> {
             ffmpeg,
         } => {
             let media = project::resolve(&path, preview)?;
+            log_info!(
+                "checking {} ({:?}) at {width}x{height} for {frames} frame(s)",
+                media.path.display(),
+                media.kind
+            );
             ensure!(
                 frames == 1 || !matches!(media.kind, project::MediaKind::Image),
                 "static images provide exactly one frame"

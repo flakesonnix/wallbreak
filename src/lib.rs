@@ -6,6 +6,7 @@ pub mod gnome_bridge;
 pub mod gui;
 #[cfg(feature = "gui")]
 pub mod library;
+pub mod log;
 pub mod media;
 pub mod project;
 #[cfg(feature = "gui")]

@@ -7,6 +7,7 @@ use eframe::egui;
 use wallbreak::gui::panel::Panel;
 
 fn main() -> eframe::Result<()> {
+    wallbreak::log::init_from_env();
     let close = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, close.clone())
