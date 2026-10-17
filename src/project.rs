@@ -8,7 +8,10 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::scene::{self, Scene, SceneProfile};
+use crate::{
+    pkg,
+    scene::{self, Scene, SceneProfile},
+};
 
 const MAX_PROJECT_BYTES: u64 = 1024 * 1024;
 
@@ -52,6 +55,84 @@ pub(crate) struct Project {
 struct ProjectGeneral {
     #[serde(default)]
     properties: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectKind {
+    Scene,
+    Video,
+    Image,
+    Web,
+    Application,
+}
+
+impl ProjectKind {
+    /// Wallpaper Engine writes type names with inconsistent casing ("Scene").
+    pub(crate) fn from_declaration(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "scene" => Some(Self::Scene),
+            "video" => Some(Self::Video),
+            "image" | "picture" | "img" => Some(Self::Image),
+            "web" | "website" => Some(Self::Web),
+            "application" | "app" | "program" => Some(Self::Application),
+            _ => None,
+        }
+    }
+
+    /// Wallpaper Engine 1.x projects may omit `type`; the declared file decides.
+    pub(crate) fn infer_from_file(file: &str) -> Option<Self> {
+        if let Some(kind) = file_kind(Path::new(file)) {
+            return Some(match kind {
+                MediaKind::Scene => Self::Scene,
+                MediaKind::Video => Self::Video,
+                MediaKind::Image => Self::Image,
+            });
+        }
+        match Path::new(file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("json") => Some(Self::Scene),
+            Some("html") | Some("htm") => Some(Self::Web),
+            Some("exe") => Some(Self::Application),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Scene => "scene",
+            Self::Video => "video",
+            Self::Image => "image",
+            Self::Web => "web",
+            Self::Application => "application",
+        }
+    }
+}
+
+impl Project {
+    /// Declared type when present and recognized, otherwise inferred from the
+    /// declared file. Projects with neither stay unknown.
+    pub(crate) fn resolved_kind(&self) -> Option<ProjectKind> {
+        self.kind
+            .as_deref()
+            .and_then(ProjectKind::from_declaration)
+            .or_else(|| self.file.as_deref().and_then(ProjectKind::infer_from_file))
+    }
+
+    /// Human-facing kind for listings: the declaration as written, the inferred
+    /// kind, or `unknown`.
+    pub(crate) fn listing_kind(&self) -> String {
+        match &self.kind {
+            Some(kind) => kind.clone(),
+            None => self
+                .resolved_kind()
+                .map(|kind| kind.as_str().to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        }
+    }
 }
 
 impl Project {
@@ -101,8 +182,8 @@ pub(crate) fn scene_project(scene_path: &Path) -> Result<Option<(PathBuf, Projec
         .parent()
         .context("project manifest has no parent directory")?;
     ensure!(
-        project.kind.as_deref() == Some("scene"),
-        "scene.json requires its adjacent project.json to declare type scene"
+        project.resolved_kind() == Some(ProjectKind::Scene),
+        "scene.json requires its adjacent project.json to declare a scene project"
     );
     let declaration = project
         .file
@@ -113,6 +194,22 @@ pub(crate) fn scene_project(scene_path: &Path) -> Result<Option<(PathBuf, Projec
         "project.json does not declare the selected scene.json; refusing to select a different scene"
     );
     Ok(Some((project.path.clone(), project)))
+}
+
+/// Select a declared scene file, materializing an adjacent `<stem>.pkg` package
+/// when the declared file is absent. Returns the scene file and the root that
+/// its relative references resolve against.
+pub(crate) fn scene_selection(
+    project_root: &Path,
+    declaration: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    match pkg::scene_source(project_root, declaration)? {
+        Some(selection) => Ok(selection),
+        None => Ok((
+            project_file(project_root, declaration)?,
+            project_root.to_path_buf(),
+        )),
+    }
 }
 
 pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
@@ -161,39 +258,79 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
                 .context("project has no preview declaration")?,
         )
     } else if let Some(project) = &project {
-        match project.kind.as_deref() {
-            Some("video") | Some("scene") => {
+        match project.resolved_kind() {
+            Some(ProjectKind::Scene) | Some(ProjectKind::Video) | Some(ProjectKind::Image) => {
                 Some(project.file.clone().context("project has no file declaration")?)
             }
-            Some(kind) => bail!(
-                "project type {kind:?} is unsupported: this player supports images/videos and supported layered scenes, not web pages or executables; use --preview explicitly for its static preview"
+            Some(ProjectKind::Web) => bail!(
+                "project is a web wallpaper: rendering its page requires a browser engine; use --preview for the static preview"
             ),
-            None => bail!("project type is unknown; use an explicit media file or --preview"),
+            Some(ProjectKind::Application) => bail!(
+                "project is an application wallpaper: executing wallpaper binaries is not supported; use --preview for the static preview"
+            ),
+            None => match project.kind.as_deref() {
+                Some(declared) => bail!(
+                    "project declares unrecognized type {declared:?}; supported types are scene, video and image"
+                ),
+                None => bail!(
+                    "project type is unknown: project.json declares no recognized type and no file extension to infer from; use an explicit media file or --preview"
+                ),
+            },
         }
     } else {
         None
     };
+    let mut scene_root = root.to_path_buf();
     let selected = if direct_scene && !preview {
-        input
+        input.clone()
     } else {
         match &declared_file {
-            Some(declaration) => project_file(root, declaration)?,
-            None => input,
+            Some(declaration) => {
+                let scene_declared = !preview
+                    && project
+                        .as_ref()
+                        .is_some_and(|project| project.resolved_kind() == Some(ProjectKind::Scene));
+                if scene_declared {
+                    let (scene_path, materialized_root) = scene_selection(root, declaration)?;
+                    scene_root = materialized_root;
+                    scene_path
+                } else {
+                    project_file(root, declaration)?
+                }
+            }
+            None => input.clone(),
         }
     };
     if !preview
         && (direct_scene
             || project
                 .as_ref()
-                .is_some_and(|project| project.kind.as_deref() == Some("scene")))
+                .is_some_and(|project| project.resolved_kind() == Some(ProjectKind::Scene)))
     {
         let colors = project
             .as_ref()
             .map(Project::colors)
             .transpose()?
             .unwrap_or_default();
-        let scene = scene::load(&selected, root, &colors)?;
+        let started = std::time::Instant::now();
+        let scene = scene::load(&selected, &scene_root, &colors)?;
         let profile = scene.profile().clone();
+        crate::log_debug!(
+            "scene {} parsed in {:.1}ms: {} layer(s), {} texture(s), {} limitation(s)",
+            selected.display(),
+            started.elapsed().as_secs_f64() * 1000.0,
+            profile.layers.len(),
+            scene
+                .profile()
+                .layers
+                .iter()
+                .map(|layer| layer.material.texture_count())
+                .sum::<usize>(),
+            profile.limitations.len()
+        );
+        for limitation in &profile.limitations {
+            crate::log_trace!("scene limitation: {limitation}");
+        }
         let limitations = profile.limitations.clone();
         return Ok(Media {
             path: selected,
@@ -215,8 +352,8 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
         );
     } else {
         ensure!(
-            resolved.kind == MediaKind::Video,
-            "video project must select a supported video file"
+            matches!(resolved.kind, MediaKind::Video | MediaKind::Image),
+            "project must select a supported image or video file"
         );
     }
     Ok(resolved)
@@ -304,6 +441,12 @@ fn media(
                 .and_then(|value| value.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            if extension == "pkg" {
+                bail!(
+                    "{} is a packed scene.pkg; select its project directory (or project.json) so the package is materialized automatically",
+                    path.display()
+                );
+            }
             bail!("unsupported media extension {extension:?}; select a supported image, video or scene.json, not a packed scene.pkg")
         }
     };
@@ -378,7 +521,11 @@ mod tests {
         fs::write(dir.path().join("clip.mp4"), b"video").unwrap();
         let selected = resolve(&dir.path().join("project.json"), false).unwrap();
         assert_eq!(selected.declared_file.as_deref(), Some("./clip.mp4"));
+        // A missing declaration is inferred from the file extension.
         project(dir.path(), r#"{"file":"clip.mp4"}"#);
+        let selected = resolve(dir.path(), false).unwrap();
+        assert_eq!(selected.kind, MediaKind::Video);
+        project(dir.path(), r#"{"file":"mystery.bin"}"#);
         assert!(resolve(dir.path(), false)
             .unwrap_err()
             .to_string()

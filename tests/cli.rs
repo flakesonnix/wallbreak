@@ -147,11 +147,11 @@ fn direct_scene_json_never_switches_to_another_declared_source() {
         ),
         (
             r#"{"type":"video","file":"clip.mp4","preview":"preview.png"}"#,
-            "type scene",
+            "declare a scene project",
         ),
         (
             r#"{"type":"web","file":"index.html","preview":"preview.png"}"#,
-            "type scene",
+            "declare a scene project",
         ),
         ("{", "invalid project.json"),
         ("[]", "JSON object"),
@@ -300,6 +300,66 @@ fn decodes_real_image_without_wayland_or_ffmpeg() {
 }
 
 #[test]
+fn packed_scene_materializes_into_the_cache_before_checking() {
+    let directory = tempfile::tempdir().unwrap();
+    scene_fixture(directory.path());
+    let names = [
+        "scene.json",
+        "models/quad.json",
+        "materials/quad.json",
+        "materials/pixel.tex",
+    ];
+    let mut table = Vec::new();
+    let mut data = Vec::new();
+    table.extend_from_slice(&(8u32).to_le_bytes());
+    table.extend_from_slice(b"PKGV0018");
+    table.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for name in names {
+        let payload = fs::read(directory.path().join(name)).unwrap();
+        table.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        table.extend_from_slice(name.as_bytes());
+        table.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        table.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&payload);
+    }
+    table.extend_from_slice(&data);
+    fs::write(directory.path().join("scene.pkg"), table).unwrap();
+    for name in names {
+        fs::remove_file(directory.path().join(name)).unwrap();
+    }
+    fs::write(
+        directory.path().join("project.json"),
+        r#"{"file":"scene.json","preview":"preview.png","type":"scene"}"#,
+    )
+    .unwrap();
+    RgbaImage::new(2, 2)
+        .save(directory.path().join("preview.png"))
+        .unwrap();
+    let cache = directory.path().join("cache");
+    let output = Command::new(BINARY)
+        .arg("check")
+        .arg(directory.path())
+        .args(["--width", "8", "--height", "8", "--frames", "1"])
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["decoded_frames"], 1);
+    let selected = result["media"]["path"].as_str().unwrap();
+    assert!(
+        selected.starts_with(cache.to_str().unwrap()),
+        "{selected} is not inside the cache"
+    );
+    assert!(selected.ends_with("scene.json"));
+    assert!(!directory.path().join("scene.json").exists());
+}
+
+#[test]
 fn scene_project_requires_explicit_preview_and_preserves_source() {
     let directory = tempfile::tempdir().unwrap();
     let source = r#"{"file":"scene.json","preview":"preview.png","type":"scene","general":{"properties":{"schemecolor":{"type":"color","value":"0 0 0"},"flagcolor1":{"type":"color","value":"1 1 1"},"flagcolor2":{"type":"color","value":"1 0 0"}}}}"#;
@@ -318,7 +378,11 @@ fn scene_project_requires_explicit_preview_and_preserves_source() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported"));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("no renderable image objects"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
     let preview = Command::new(BINARY)
         .arg("check")
         .arg(directory.path())

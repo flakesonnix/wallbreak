@@ -8,6 +8,7 @@ pub mod gui;
 pub mod library;
 pub mod log;
 pub mod media;
+mod pkg;
 pub mod project;
 #[cfg(feature = "gui")]
 pub mod renderer;

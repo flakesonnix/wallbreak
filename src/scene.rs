@@ -12,18 +12,18 @@
 //! camera is offset while the object and preview remain canvas-centered.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     media::{frame_len, Fit},
     project::open_regular_file,
-    texture::{load as load_texture, Texture},
+    texture::{load_any as load_texture, Texture},
 };
 
 const MAX_SCENE_BYTES: u64 = 4 * 1024 * 1024;
@@ -129,7 +129,7 @@ struct LayerRuntime {
 }
 
 impl MaterialProfile {
-    fn texture_count(&self) -> usize {
+    pub(crate) fn texture_count(&self) -> usize {
         match self {
             MaterialProfile::Flag { .. } => 3,
             MaterialProfile::Generic { .. } => 1,
@@ -306,67 +306,172 @@ pub struct SceneFrame {
     started: std::time::Instant,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize)]
 struct SceneDocument {
     camera: CameraDocument,
     general: GeneralDocument,
     objects: Vec<ObjectDocument>,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize)]
 struct CameraDocument {
     center: String,
     eye: String,
     up: String,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize)]
 struct GeneralDocument {
     ambientcolor: Option<String>,
-    bloom: bool,
+    #[serde(default)]
+    bloom: Option<BloomSetting>,
     clearcolor: String,
     norecompile: Option<bool>,
-    orthogonalprojection: ProjectionDocument,
+    #[serde(default)]
+    orthogonalprojection: Option<ProjectionDocument>,
     skylightcolor: Option<String>,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `bloom` is a boolean in most versions; newer scenes configure it with an
+/// object. Both forms mean bloom is enabled.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BloomSetting {
+    Plain(bool),
+    Configured(serde_json::Value),
+}
+
+impl BloomSetting {
+    fn enabled(&self) -> bool {
+        match self {
+            Self::Plain(enabled) => *enabled,
+            Self::Configured(_) => true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectionDocument {
     height: u32,
     width: u32,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A scene value that may be a plain string or a `{value, script}` object.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ScriptedValue {
+    Plain(String),
+    Scripted {
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        script: Option<String>,
+    },
+}
+
+impl ScriptedValue {
+    fn value(&self) -> Option<&str> {
+        match self {
+            Self::Plain(value) => Some(value),
+            Self::Scripted { value, .. } => value.as_deref(),
+        }
+    }
+
+    fn is_scripted(&self) -> bool {
+        matches!(self, Self::Scripted { .. })
+    }
+}
+
+/// Object visibility may be a boolean or a condition object.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum VisibleValue {
+    Plain(bool),
+    Conditional(serde_json::Value),
+}
+
+impl VisibleValue {
+    fn hidden(&self) -> bool {
+        matches!(self, Self::Plain(false))
+    }
+
+    fn is_conditional(&self) -> bool {
+        matches!(self, Self::Conditional(_))
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ObjectDocument {
-    angles: String,
+    #[serde(default)]
     id: u32,
-    image: String,
+    #[serde(default)]
     name: String,
-    origin: String,
-    scale: String,
+    #[serde(default)]
+    angles: Option<ScriptedValue>,
+    #[serde(default)]
+    origin: Option<ScriptedValue>,
+    #[serde(default)]
+    scale: Option<ScriptedValue>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    visible: Option<VisibleValue>,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CameraPathDocument {
+    paths: Vec<CameraPathTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CameraPathTrack {
+    duration: f32,
+    #[serde(default)]
+    name: Option<String>,
+    transforms: Vec<CameraTransformDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CameraTransformDocument {
+    center: String,
+    eye: String,
+    up: String,
+    timestamp: f32,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ModelDocument {
-    height: u32,
+    #[serde(default)]
+    height: Option<u32>,
     material: String,
-    width: u32,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    autosize: bool,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct MaterialDocument {
     passes: Vec<PassDocument>,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PassDocument {
     #[serde(default)]
     combos: HashMap<String, u8>,
@@ -375,11 +480,13 @@ struct PassDocument {
     depthtest: String,
     depthwrite: String,
     shader: String,
-    textures: Vec<String>,
+    textures: Vec<Option<String>>,
     #[serde(default)]
     usershadervalues: HashMap<String, String>,
     blending: Option<String>,
     cullmode: Option<String>,
+    #[serde(default, flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 /// Validated scene metadata without decoded textures.
@@ -399,42 +506,69 @@ pub fn load(
     project_root: &Path,
     properties: &HashMap<String, [f32; 3]>,
 ) -> Result<Scene> {
-    let spec = parse(scene_path, project_root, properties)?;
-    let mut textures = Vec::with_capacity(spec.texture_paths.len());
+    let mut spec = parse(scene_path, project_root, properties)?;
+    let mut textures: Vec<Option<Texture>> = Vec::with_capacity(spec.texture_paths.len());
     let mut rgba_total = 0usize;
     for path in &spec.texture_paths {
-        let texture = load_texture(path)
-            .with_context(|| format!("invalid native texture {}", path.display()))?;
-        rgba_total = rgba_total
-            .checked_add(texture.rgba.len())
-            .context("scene texture total overflow")?;
-        ensure!(
-            rgba_total <= MAX_TEXTURE_RGBA_TOTAL,
-            "scene textures exceed 64 MiB decoded budget"
-        );
-        textures.push(texture);
+        match load_texture(path) {
+            Ok(texture) => {
+                rgba_total = rgba_total
+                    .checked_add(texture.rgba.len())
+                    .context("scene texture total overflow")?;
+                ensure!(
+                    rgba_total <= MAX_TEXTURE_RGBA_TOTAL,
+                    "scene textures exceed 64 MiB decoded budget"
+                );
+                textures.push(Some(texture));
+            }
+            Err(error) => {
+                crate::log_debug!(
+                    "scene texture {} cannot be decoded: {error:#}",
+                    path.display()
+                );
+                textures.push(None);
+            }
+        }
     }
-    let mut textures = textures.into_iter();
     let mut layers = Vec::with_capacity(spec.profile.layers.len());
+    let mut kept = Vec::with_capacity(spec.profile.layers.len());
+    let mut texture_index = 0usize;
+    let mut dropped: Vec<String> = Vec::new();
     for layer in &spec.profile.layers {
         let count = layer.material.texture_count();
-        let mut owned = Vec::with_capacity(count);
-        for _ in 0..count {
-            owned.push(
-                textures
-                    .next()
-                    .context("scene texture budget miscounted its layers")?,
-            );
+        let slice = textures
+            .get(texture_index..texture_index + count)
+            .context("scene texture budget miscounted its layers")?;
+        texture_index += count;
+        if slice.iter().all(Option::is_some) {
+            let owned = slice.iter().flatten().cloned().collect();
+            layers.push(LayerRuntime {
+                geometry: LayerGeometry {
+                    center: layer.center,
+                    extents: layer.extents,
+                    rotation: layer.rotation,
+                },
+                material: MaterialRuntime::bind(&layer.material, owned)?,
+            });
+            kept.push(layer.clone());
+        } else {
+            dropped.push(format!(
+                "object {:?} is not rendered: one of its textures cannot be decoded",
+                layer.name
+            ));
         }
-        layers.push(LayerRuntime {
-            geometry: LayerGeometry {
-                center: layer.center,
-                extents: layer.extents,
-                rotation: layer.rotation,
-            },
-            material: MaterialRuntime::bind(&layer.material, owned)?,
-        });
     }
+    // Loading fails only when parsing and decoding together leave nothing
+    // renderable; an explicitly invisible scene still renders its clear color.
+    ensure!(
+        !layers.is_empty() || spec.profile.layers.is_empty(),
+        "scene has no decodable image objects ({})",
+        join_bounded(&dropped, 6)
+    );
+    if !dropped.is_empty() {
+        spec.profile.limitations.extend(dropped);
+    }
+    spec.profile.layers = kept;
     Ok(Scene {
         profile: spec.profile,
         layers,
@@ -444,6 +578,8 @@ pub fn load(
 /// Validate one layered scene project selection without decoding textures.
 ///
 /// Used to mark Steam projects as supported before the user selects one.
+/// Unknown fields and unsupported object kinds are tolerated and summarized in
+/// `profile.limitations`; a scene fails only when nothing renderable remains.
 pub fn parse(
     scene_path: &Path,
     project_root: &Path,
@@ -451,21 +587,54 @@ pub fn parse(
 ) -> Result<SceneSpec> {
     let document: SceneDocument =
         read_json(scene_path, MAX_SCENE_BYTES).context("invalid scene.json")?;
-    ensure!(!document.objects.is_empty(), "scene has no image objects");
     let camera = Camera {
         eye: parse_triplet(&document.camera.eye).context("invalid camera eye")?,
         center: parse_triplet(&document.camera.center).context("invalid camera center")?,
         up: parse_triplet(&document.camera.up).context("invalid camera up")?,
     };
-    ensure!(!document.general.bloom, "unsupported bloom-enabled scene");
-    let projection = [
-        document.general.orthogonalprojection.width,
-        document.general.orthogonalprojection.height,
-    ];
-    ensure!(
-        projection[0] > 0 && projection[1] > 0,
-        "scene projection must be nonzero"
-    );
+    let mut derived_note: Option<String> = None;
+    let projection = match &document.general.orthogonalprojection {
+        Some(projection) if projection.width > 0 && projection.height > 0 => {
+            [projection.width, projection.height]
+        }
+        other => {
+            // Perspective or malformed projection: approximate the visible
+            // frustum slice at the camera focus distance as an orthographic view.
+            let depth = [
+                camera.center[0] - camera.eye[0],
+                camera.center[1] - camera.eye[1],
+                camera.center[2] - camera.eye[2],
+            ];
+            let distance = f64::from(
+                (depth[0] * depth[0] + depth[1] * depth[1] + depth[2] * depth[2])
+                    .sqrt()
+                    .clamp(0.1, 10_000.0),
+            );
+            let fov = document
+                .general
+                .extra
+                .get("fov")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|fov| fov.is_finite() && *fov > 1.0 && *fov < 179.0)
+                .unwrap_or(50.0);
+            let height = (2.0 * (fov.to_radians() / 2.0).tan() * distance).clamp(0.1, 32_768.0);
+            let width = (height * 16.0 / 9.0).clamp(0.1, 32_768.0);
+            let derived = [width.round() as u32, height.round() as u32];
+            let note = if other.is_some() {
+                format!(
+                    "Orthogonal projection is zero-sized; approximated from camera distance at {fov:.0}° fov: {}x{} units.",
+                    derived[0], derived[1]
+                )
+            } else {
+                format!(
+                    "Scene has no orthogonal projection; the perspective view is approximated orthographically from camera distance at {fov:.0}° fov: {}x{} units.",
+                    derived[0], derived[1]
+                )
+            };
+            derived_note = Some(note);
+            derived
+        }
+    };
     ensure!(
         u64::from(projection[0]) * u64::from(projection[1]) <= 67_108_864,
         "scene projection exceeds 64 megapixels"
@@ -479,12 +648,133 @@ pub fn parse(
         parse_triplet(sky).context("invalid skylightcolor")?;
     }
     let _ = document.general.norecompile;
+
+    let mut limitations = vec![
+        "Renders orthographic image quads back-to-front with flag, generic, flow, and sway materials; camera eye/center metadata are retained, not used for placement.".into(),
+        "Uses native TEX or raw image textures; animation plays its first frame only.".into(),
+        "CPU reimplementation of the shipped vertex/fragment behavior; no engine code is executed.".into(),
+    ];
+    if let Some(note) = derived_note.take() {
+        limitations.push(note);
+    }
+    if let Some(setting) = document.general.bloom.as_ref() {
+        if setting.enabled() {
+            if let BloomSetting::Configured(config) = setting {
+                crate::log_debug!("scene bloom is configured but not applied: {config}");
+            }
+            limitations.push("Bloom post-processing is not applied.".into());
+        }
+    }
+
     let mut layers = Vec::with_capacity(document.objects.len());
     let mut texture_paths = Vec::new();
+    let mut skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut ignored_object_keys: BTreeSet<String> = BTreeSet::new();
+    let mut hidden = 0usize;
+    let mut conditional_visibility = 0usize;
+    let mut scripted_transforms = 0usize;
+    let mut notes: BTreeSet<String> = BTreeSet::new();
     for object in &document.objects {
-        let (layer, paths) = parse_layer(object, project_root, properties)?;
-        texture_paths.extend(paths);
-        layers.push(layer);
+        if object.visible.as_ref().is_some_and(VisibleValue::hidden) {
+            hidden += 1;
+            continue;
+        }
+        if object
+            .visible
+            .as_ref()
+            .is_some_and(VisibleValue::is_conditional)
+        {
+            if let Some(VisibleValue::Conditional(condition)) = object.visible.as_ref() {
+                crate::log_trace!(
+                    "object {:?} visibility condition is not evaluated: {condition}",
+                    object_label(object)
+                );
+            }
+            conditional_visibility += 1;
+        }
+        if [&object.angles, &object.origin, &object.scale]
+            .iter()
+            .any(|value| value.as_ref().is_some_and(ScriptedValue::is_scripted))
+        {
+            scripted_transforms += 1;
+        }
+        let Some(image) = &object.image else {
+            *skipped.entry(skipped_object_category(object)).or_default() += 1;
+            continue;
+        };
+        match parse_layer(object, image, project_root, properties, &mut notes) {
+            Ok((layer, paths)) => {
+                for key in object.extra.keys() {
+                    ignored_object_keys.insert(key.clone());
+                }
+                texture_paths.extend(paths);
+                layers.push(layer);
+            }
+            Err(error) => failures.push(format!(
+                "object {:?} is not rendered: {error:#}",
+                object_label(object)
+            )),
+        }
+    }
+    let rendered = layers.len();
+    let visible_total = document.objects.len().saturating_sub(hidden);
+    // An explicitly invisible scene still renders (its clear color); anything
+    // else with no renderable object fails with the recorded reasons.
+    ensure!(
+        !layers.is_empty() || hidden > 0,
+        "scene has no renderable image objects ({})",
+        omitted_summary(&skipped, &failures, hidden)
+    );
+    if rendered < visible_total {
+        let mut omitted: Vec<String> = skipped
+            .iter()
+            .map(|(category, count)| format!("{count} {category}"))
+            .collect();
+        omitted.extend(failures.iter().cloned());
+        limitations.push(format!(
+            "Renders {rendered} of {visible_total} objects; the rest are omitted: {}.",
+            join_bounded(&omitted, 6)
+        ));
+    }
+    if hidden > 0 {
+        limitations.push(format!("{hidden} object(s) are declared invisible."));
+    }
+    if scripted_transforms > 0 {
+        limitations.push(format!(
+            "{scripted_transforms} object transform(s) are scripted; their declared static values are used."
+        ));
+    }
+    if conditional_visibility > 0 {
+        limitations.push(format!(
+            "{conditional_visibility} object visibility condition(s) are not evaluated; those objects are shown."
+        ));
+    }
+    limitations.extend(notes);
+    if !document.camera.paths.is_empty() {
+        limitations.push(
+            match load_camera_paths(project_root, &document.camera.paths) {
+                Ok((tracks, total)) => format!(
+                    "Camera path animation ({tracks} track(s), {total:.1}s per cycle) is not applied; the declared camera transform stays static."
+                ),
+                Err(error) => {
+                    format!("Camera path scripts were not applied: {error:#}.")
+                }
+            },
+        );
+    }
+    for (label, keys) in [
+        ("Ignored scene options", keys_of(&document.general.extra)),
+        ("Ignored camera options", keys_of(&document.camera.extra)),
+        ("Ignored scene fields", keys_of(&document.extra)),
+        (
+            "Ignored object properties",
+            ignored_object_keys.into_iter().collect(),
+        ),
+    ] {
+        if !keys.is_empty() {
+            limitations.push(format!("{label}: {}.", join_bounded(&keys, 8)));
+        }
     }
     let profile = SceneProfile {
         scene_path: scene_path.to_path_buf(),
@@ -492,11 +782,7 @@ pub fn parse(
         clear_color,
         camera,
         layers,
-        limitations: vec![
-            "Renders orthographic image quads back-to-front with flag, generic, flow, and sway materials; camera eye/center metadata are retained, not used for placement.".into(),
-            "Uses native TEX textures only; embedded PNG files are not substituted.".into(),
-            "CPU reimplementation of the shipped vertex/fragment behavior; no engine code is executed.".into(),
-        ],
+        limitations,
     };
     Ok(SceneSpec {
         profile,
@@ -504,38 +790,174 @@ pub fn parse(
     })
 }
 
+fn keys_of(map: &HashMap<String, serde_json::Value>) -> Vec<String> {
+    map.keys().cloned().collect()
+}
+
+fn skipped_object_category(object: &ObjectDocument) -> &'static str {
+    if object.model.is_some() {
+        "3D models"
+    } else if object.extra.contains_key("particle") || object.extra.contains_key("particlesrc") {
+        "particle systems"
+    } else if object.extra.contains_key("text") {
+        "text objects"
+    } else if object.extra.contains_key("sound") {
+        "sound objects"
+    } else if object.extra.contains_key("light") {
+        "light objects"
+    } else if object.extra.contains_key("sprite") {
+        "sprite objects"
+    } else if object.extra.contains_key("solid") {
+        "solid shapes"
+    } else {
+        "objects without image or model"
+    }
+}
+
+fn omitted_summary(
+    skipped: &BTreeMap<&'static str, usize>,
+    failures: &[String],
+    hidden: usize,
+) -> String {
+    let mut parts: Vec<String> = skipped
+        .iter()
+        .map(|(category, count)| format!("{count} {category}"))
+        .collect();
+    parts.extend(failures.iter().cloned());
+    if hidden > 0 {
+        parts.push(format!("{hidden} invisible"));
+    }
+    if parts.is_empty() {
+        parts.push("no image objects declared".into());
+    }
+    join_bounded(&parts, 6)
+}
+
+fn join_bounded(parts: &[String], limit: usize) -> String {
+    if parts.len() <= limit {
+        return parts.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        parts[..limit].join(", "),
+        parts.len() - limit
+    )
+}
+
+/// Validate the declared camera path scripts and report track count and cycle
+/// duration. The scripts are not applied to rendering yet.
+fn load_camera_paths(project_root: &Path, paths: &[String]) -> Result<(usize, f32)> {
+    ensure!(
+        paths.len() <= 16,
+        "camera declares {} path scripts",
+        paths.len()
+    );
+    let mut tracks = 0usize;
+    let mut total = 0.0f32;
+    for declaration in paths {
+        let path = root_relative(project_root, declaration)?;
+        let document: CameraPathDocument = read_json(&path, MAX_JSON_BYTES)?;
+        ensure!(
+            !document.paths.is_empty(),
+            "camera path script {} has no tracks",
+            declaration
+        );
+        for track in &document.paths {
+            ensure!(
+                track.duration.is_finite() && track.duration > 0.0,
+                "camera path track has invalid duration"
+            );
+            ensure!(
+                !track.transforms.is_empty(),
+                "camera path track has no transforms"
+            );
+            let _ = &track.name;
+            for transform in &track.transforms {
+                ensure!(transform.timestamp.is_finite(), "invalid camera timestamp");
+                parse_triplet(&transform.center).context("invalid camera path center")?;
+                parse_triplet(&transform.eye).context("invalid camera path eye")?;
+                parse_triplet(&transform.up).context("invalid camera path up")?;
+            }
+            tracks += 1;
+            total += track.duration;
+        }
+    }
+    Ok((tracks, total))
+}
+
+fn object_label(object: &ObjectDocument) -> String {
+    if !object.name.is_empty() {
+        return object.name.clone();
+    }
+    if let Some(image) = &object.image {
+        return image.clone();
+    }
+    if let Some(model) = &object.model {
+        return model.clone();
+    }
+    format!("object {}", object.id)
+}
+
 fn parse_layer(
     object: &ObjectDocument,
+    image: &str,
     project_root: &Path,
     properties: &HashMap<String, [f32; 3]>,
+    notes: &mut BTreeSet<String>,
 ) -> Result<(LayerProfile, Vec<PathBuf>)> {
-    let angles = parse_triplet(&object.angles).context("invalid object angles")?;
+    let component = |value: &Option<ScriptedValue>| {
+        value
+            .as_ref()
+            .and_then(ScriptedValue::value)
+            .map(str::to_string)
+    };
+    for (field, value) in [
+        ("angles", &object.angles),
+        ("origin", &object.origin),
+        ("scale", &object.scale),
+    ] {
+        if let Some(ScriptedValue::Scripted { script, .. }) = value {
+            crate::log_debug!(
+                "object {:?} {field} is scripted{}; using its declared static value",
+                object_label(object),
+                script
+                    .as_deref()
+                    .map(|script| format!(" by {script:?}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    let angles = parse_triplet(component(&object.angles).as_deref().unwrap_or("0 0 0"))
+        .context("invalid object angles")?;
     ensure!(
         angles[0] == 0.0 && angles[1] == 0.0 && angles[2].is_finite(),
         "unsupported object rotation {angles:?}; only in-plane rotation is supported"
     );
     let rotation = angles[2];
-    let origin = parse_triplet(&object.origin).context("invalid object origin")?;
-    let scale = parse_triplet(&object.scale).context("invalid object scale")?;
+    let origin = parse_triplet(component(&object.origin).as_deref().unwrap_or("0 0 0"))
+        .context("invalid object origin")?;
+    let scale = parse_triplet(component(&object.scale).as_deref().unwrap_or("1 1 1"))
+        .context("invalid object scale")?;
     ensure!(
-        scale[0].is_finite()
-            && scale[1].is_finite()
-            && scale[0] > 0.0
-            && scale[1] > 0.0
-            && scale[2] == 1.0,
+        scale[0].is_finite() && scale[1].is_finite() && scale[0] > 0.0 && scale[1] > 0.0,
         "unsupported object scale {scale:?}"
     );
-    let model_path = root_relative(project_root, &object.image).context("invalid scene model")?;
+    let model_path = root_relative(project_root, image).context("invalid scene model")?;
     let model: ModelDocument =
         read_json(&model_path, MAX_JSON_BYTES).context("invalid scene model")?;
-    ensure!(
-        model.width > 0 && model.height > 0,
-        "scene model dimensions must be nonzero"
-    );
+    for key in model.extra.keys() {
+        crate::log_trace!("ignored model key {key:?} in {}", model_path.display());
+    }
     let material_path =
         root_relative(project_root, &model.material).context("invalid scene material")?;
     let material: MaterialDocument =
         read_json(&material_path, MAX_JSON_BYTES).context("invalid scene material")?;
+    for key in material.extra.keys() {
+        crate::log_trace!(
+            "ignored material key {key:?} in {}",
+            material_path.display()
+        );
+    }
     ensure!(
         material.passes.len() == 1,
         "unsupported object with {} material passes",
@@ -545,30 +967,62 @@ fn parse_layer(
     let project_root = project_root
         .canonicalize()
         .context("cannot resolve scene project root")?;
-    let (profile, stems) = parse_material(&material.passes[0], &project_root, properties)?;
+    let (profile, stems) = parse_material(&material.passes[0], &project_root, properties, notes)?;
     let mut paths = Vec::with_capacity(stems.len());
     for stem in &stems {
-        paths.push(scene_relative(
-            material_root,
-            &project_root,
-            &format!("{stem}.tex"),
-        )?);
+        paths.push(resolve_texture(material_root, &project_root, stem)?);
     }
+    let (width, height) = match (model.width, model.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 && !model.autosize => {
+            (width, height)
+        }
+        _ => {
+            // Autosized (or underspecified) models take the base texture size.
+            let (width, height) = crate::texture::dimensions(&paths[0])
+                .with_context(|| format!("cannot autosize model {:?}", object_label(object)))?;
+            crate::log_debug!(
+                "scene model {:?} is autosized from {}: {width}x{height}",
+                object_label(object),
+                paths[0].display()
+            );
+            (width, height)
+        }
+    };
     Ok((
         LayerProfile {
             id: object.id,
             name: object.name.clone(),
             center: [origin[0], origin[1]],
-            extents: [
-                (model.width as f32) * scale[0],
-                (model.height as f32) * scale[1],
-            ],
+            extents: [(width as f32) * scale[0], (height as f32) * scale[1]],
             rotation,
-            model: [model.width, model.height],
+            model: [width, height],
             material: profile,
         },
         paths,
     ))
+}
+
+/// Resolve one material texture name against the material's directory. Native
+/// TEX wins, then raw image files the `image` crate can decode.
+fn resolve_texture(material_root: &Path, project_root: &Path, stem: &str) -> Result<PathBuf> {
+    let relative = Path::new(stem);
+    let mut candidates = Vec::new();
+    if relative.extension().is_some() {
+        candidates.push(relative.to_path_buf());
+    } else {
+        for extension in ["tex", "png", "jpg", "jpeg", "gif", "webp"] {
+            candidates.push(Path::new(&format!("{stem}.{extension}")).to_path_buf());
+        }
+    }
+    let mut last_error = None;
+    for candidate in &candidates {
+        let declaration = candidate.to_string_lossy();
+        match scene_relative(material_root, project_root, &declaration) {
+            Ok(path) => return Ok(path),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no texture candidates for {stem:?}")))
 }
 
 fn finite(constants: &HashMap<String, f32>, name: &str) -> Result<f32> {
@@ -593,7 +1047,24 @@ fn parse_material(
     pass: &PassDocument,
     project_root: &Path,
     properties: &HashMap<String, [f32; 3]>,
+    notes: &mut BTreeSet<String>,
 ) -> Result<(MaterialProfile, Vec<String>)> {
+    for key in pass.extra.keys() {
+        crate::log_trace!(
+            "ignored material pass key {key:?} in shader {:?}",
+            pass.shader
+        );
+    }
+    if let Some(usertextures) = pass.extra.get("usertextures") {
+        if usertextures
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            notes.insert(
+                "User-selected textures are not applied; bundled textures are rendered.".into(),
+            );
+        }
+    }
     ensure!(
         pass.depthtest == "disabled" && pass.depthwrite == "disabled",
         "unsupported depth mode {:?}/{:?}; only disabled depth is supported",
@@ -609,6 +1080,7 @@ fn parse_material(
         Some("additive") => Blending::Additive,
         Some(other) => anyhow::bail!("unsupported blending {other:?}"),
     };
+    let textures: Vec<String> = pass.textures.iter().flatten().cloned().collect();
     match pass.shader.as_str() {
         "flag" => {
             ensure!(
@@ -619,6 +1091,10 @@ fn parse_material(
                 pass.textures.len() == 3,
                 "unsupported flag texture count {}",
                 pass.textures.len()
+            );
+            ensure!(
+                textures.len() == 3,
+                "unsupported flag texture slots; all three must be declared"
             );
             ensure!(
                 pass.usershadervalues.get("schemecolor").map(String::as_str) == Some("color1")
@@ -644,29 +1120,43 @@ fn parse_material(
                     speed: finite(&pass.constantshadervalues, "Speed")?,
                     strength: finite(&pass.constantshadervalues, "Strength")?,
                     textures: [
-                        pass.textures[0].clone(),
-                        pass.textures[1].clone(),
-                        pass.textures[2].clone(),
+                        textures[0].clone(),
+                        textures[1].clone(),
+                        textures[2].clone(),
                     ],
                 },
-                pass.textures.clone(),
+                textures,
             ))
         }
-        "genericimage" | "genericimage2" => {
-            ensure!(
-                pass.combos.is_empty(),
-                "unsupported generic combos {:?}; only default shading is supported",
-                pass.combos
-            );
+        "genericimage" | "genericimage2" | "genericimage4" => {
+            for (name, value) in &pass.combos {
+                match name.to_ascii_uppercase().as_str() {
+                    "VERSION" => {
+                        notes.insert(format!(
+                            "Material variant VERSION={value} is rendered as the base image."
+                        ));
+                    }
+                    "LIGHTING" | "REFLECTION" => ensure!(
+                        *value == 0,
+                        "material {name}={value} enables per-pixel {name}; not supported"
+                    ),
+                    _ => anyhow::bail!("unsupported generic combo {name:?}"),
+                }
+            }
             ensure!(
                 pass.usershadervalues.is_empty(),
                 "unsupported generic user shader values"
             );
             ensure!(
-                pass.textures.len() == 1,
-                "unsupported generic texture count {}",
-                pass.textures.len()
+                !textures.is_empty(),
+                "unsupported generic material without a texture"
             );
+            if textures.len() > 1 {
+                notes.insert(format!(
+                    "{} additional material map(s) are ignored.",
+                    textures.len() - 1
+                ));
+            }
             for name in pass.constantshadervalues.keys() {
                 ensure!(
                     matches!(
@@ -688,12 +1178,12 @@ fn parse_material(
                         optional_finite(&pass.constantshadervalues, "Scroll 1 Y", 0.0)?,
                     ],
                     blending,
-                    texture: pass.textures[0].clone(),
+                    texture: textures[0].clone(),
                 },
-                pass.textures.clone(),
+                vec![textures[0].clone()],
             ))
         }
-        "flowimage" if pass.textures.len() == 2 => {
+        "flowimage" if textures.len() == 2 => {
             ensure!(
                 pass.combos.is_empty() && pass.usershadervalues.is_empty(),
                 "unsupported flow combos or user values"
@@ -719,10 +1209,10 @@ fn parse_material(
                     speed: finite(&pass.constantshadervalues, "Speed")?,
                     amount: finite(&pass.constantshadervalues, "Amount")?,
                     bias: flow_bias(project_root)?,
-                    base: pass.textures[0].clone(),
-                    mask: pass.textures[1].clone(),
+                    base: textures[0].clone(),
+                    mask: textures[1].clone(),
                 },
-                pass.textures.clone(),
+                textures,
             ))
         }
         "flowimage" => {
@@ -731,9 +1221,9 @@ fn parse_material(
                 "unsupported flow combos or user values"
             );
             ensure!(
-                pass.textures.len() == 4,
+                textures.len() == 4,
                 "unsupported flow texture count {}",
-                pass.textures.len()
+                textures.len()
             );
             for name in pass.constantshadervalues.keys() {
                 ensure!(
@@ -762,14 +1252,14 @@ fn parse_material(
                         finite(&pass.constantshadervalues, "Speed2")?,
                     ],
                     bias: flow_bias(project_root)?,
-                    mask: pass.textures[0].clone(),
+                    mask: textures[0].clone(),
                     layers: [
-                        pass.textures[1].clone(),
-                        pass.textures[2].clone(),
-                        pass.textures[3].clone(),
+                        textures[1].clone(),
+                        textures[2].clone(),
+                        textures[3].clone(),
                     ],
                 },
-                pass.textures.clone(),
+                textures,
             ))
         }
         "swayimage" => {
@@ -778,9 +1268,9 @@ fn parse_material(
                 "unsupported sway combos or user values"
             );
             ensure!(
-                pass.textures.len() == 2,
+                textures.len() == 2,
                 "unsupported sway texture count {}",
-                pass.textures.len()
+                textures.len()
             );
             for name in pass.constantshadervalues.keys() {
                 ensure!(
@@ -802,10 +1292,10 @@ fn parse_material(
                     brightness: optional_finite(&pass.constantshadervalues, "Bright", 1.0)?,
                     speed: finite(&pass.constantshadervalues, "Speed")?,
                     amount: finite(&pass.constantshadervalues, "Amount")?,
-                    base: pass.textures[0].clone(),
-                    mask: pass.textures[1].clone(),
+                    base: textures[0].clone(),
+                    mask: textures[1].clone(),
                 },
-                pass.textures.clone(),
+                textures,
             ))
         }
         other => anyhow::bail!("unsupported scene shader {other:?}"),
@@ -1324,26 +1814,33 @@ fn channel(value: f32) -> u8 {
     (value * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// Extract the color values of a project's declared properties. Non-color
+/// editable properties (slider, combo, bool, texture, checkbox) and properties
+/// without a type are tolerated and ignored; malformed color values still fail.
 pub fn parse_project_colors(
     properties: &HashMap<String, serde_json::Value>,
 ) -> Result<HashMap<String, [f32; 3]>> {
     let mut colors = HashMap::new();
     for (name, property) in properties {
         let Some(object) = property.as_object() else {
-            bail!("scene project property {name:?} must be an object")
+            crate::log_debug!("scene project property {name:?} is not an object; ignored");
+            continue;
         };
+        // Legacy projects may omit the type; a parseable triplet is still a color.
         let kind = object
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .context("scene project property type is missing")?;
-        ensure!(
-            kind == "color",
-            "unsupported scene project property {name:?} of type {kind:?}"
-        );
+            .unwrap_or("color");
+        if !kind.eq_ignore_ascii_case("color") {
+            crate::log_debug!(
+                "scene project property {name:?} of type {kind:?} is not a color; ignored"
+            );
+            continue;
+        }
         let value = object
             .get("value")
             .and_then(serde_json::Value::as_str)
-            .context("scene project color value is missing")?;
+            .with_context(|| format!("scene project color {name:?} value is missing"))?;
         colors.insert(name.clone(), parse_triplet(value)?);
     }
     Ok(colors)
@@ -1427,33 +1924,89 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_scene_features_before_textures() {
+    fn tolerates_unsupported_features_and_skips_only_unrenderable_objects() {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path());
         let scene_path = root.path().join("scene.json");
+        let original = std::fs::read(&scene_path).unwrap();
         let mutate = |mutate: &dyn Fn(&mut serde_json::Value)| {
-            let mut document: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&scene_path).unwrap()).unwrap();
+            std::fs::write(&scene_path, &original).unwrap();
+            let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
             mutate(&mut document);
             std::fs::write(&scene_path, serde_json::to_vec(&document).unwrap()).unwrap();
-            let error = load(&scene_path, root.path(), &properties(root.path())).unwrap_err();
-            std::fs::write(
-                &scene_path,
-            r#"{"camera":{"center":"0 0 -1","eye":"0 0 0","up":"0 1 0"},"general":{"bloom":false,"clearcolor":"0.1 0.2 0.3","orthogonalprojection":{"width":6,"height":2}},"objects":[{"angles":"0 0 0","id":7,"image":"models/quad.json","name":"quad","origin":"3 1 0","scale":"1 1 1"}]}"#,
-            )
-            .unwrap();
-            format!("{error:#}")
+            load(&scene_path, root.path(), &properties(root.path()))
         };
-        assert!(mutate(&|document| document["objects"][0]["angles"] =
-            serde_json::Value::String("0 1 0".into()))
-        .contains("rotation"));
-        assert!(
+        // An unsupported single object leaves nothing renderable; the reason survives.
+        let error = mutate(&|document| {
+            document["objects"][0]["angles"] = serde_json::Value::String("0 1 0".into())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("rotation"));
+        // Bloom and unknown fields are tolerated and reported instead of failing.
+        let scene =
             mutate(&|document| document["general"]["bloom"] = serde_json::Value::Bool(true))
-                .contains("bloom")
+                .unwrap();
+        assert!(scene
+            .profile
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("Bloom")));
+        let error = mutate(&|document| {
+            document["objects"][0]["image"] =
+                serde_json::Value::String("models/missing.json".into())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid scene model"));
+        let scene = mutate(&|document| {
+            document["objects"][0]["parallaxDepth"] = serde_json::json!(0.25);
+            document["general"]["hdr"] = serde_json::json!(true);
+            document["camera"]["paths"] = serde_json::json!(["scripts/camera_00.json"]);
+        })
+        .unwrap();
+        let limitations = scene.profile.limitations.join("\n");
+        assert!(limitations.contains("parallaxDepth"));
+        assert!(limitations.contains("hdr"));
+        assert!(limitations.contains("Camera path scripts were not applied"));
+        assert_eq!(scene.profile.layers.len(), 1);
+        // An invisible object is omitted by intent, not reported as unsupported.
+        let scene =
+            mutate(&|document| document["objects"][0]["visible"] = serde_json::Value::Bool(false))
+                .unwrap();
+        assert_eq!(scene.profile.layers.len(), 0);
+        assert!(scene
+            .profile
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("invisible")));
+    }
+
+    #[test]
+    fn skips_3d_models_particles_and_geometry_less_objects() {
+        let root = tempfile::tempdir().unwrap();
+        layered_fixture(root.path());
+        let scene_path = root.path().join("scene.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&scene_path).unwrap()).unwrap();
+        let objects = document["objects"].as_array_mut().unwrap();
+        objects.push(serde_json::json!({"angles":"0 0 0","id":3,"name":"cube","model":"models/cube.mdl","origin":"3 1 0","scale":"1 1 1"}));
+        objects.push(serde_json::json!({"id":4,"name":"sparks","origin":"3 1 0","particlesrc":"particles/sparks.json"}));
+        objects.push(
+            serde_json::json!({"id":5,"name":"mystery","origin":"3 1 0","somethingnew":true}),
         );
-        assert!(mutate(&|document| document["objects"][0]["image"] =
-            serde_json::Value::String("models/missing.json".into()))
-        .contains("invalid scene model"));
+        std::fs::write(&scene_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let scene = load(&scene_path, root.path(), &HashMap::new()).unwrap();
+        assert_eq!(scene.profile.layers.len(), 2);
+        let limitations = scene.profile.limitations.join("\n");
+        assert!(
+            limitations.contains("Renders 2 of 5 objects"),
+            "{limitations}"
+        );
+        assert!(limitations.contains("1 3D models"), "{limitations}");
+        assert!(limitations.contains("1 particle systems"), "{limitations}");
+        assert!(
+            limitations.contains("1 objects without image or model"),
+            "{limitations}"
+        );
     }
 
     fn tex_bytes(pixels: Vec<u8>) -> Vec<u8> {
@@ -1538,35 +2091,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_shaders_combos_and_blending() {
+    fn unsupported_materials_skip_their_object_with_the_reason_preserved() {
         let root = tempfile::tempdir().unwrap();
         layered_fixture(root.path());
         let material = root.path().join("materials/plain.json");
         let mutate = |text: &str| {
             std::fs::write(&material, text).unwrap();
-            let error = load(
+            let scene = load(
                 &root.path().join("scene.json"),
                 root.path(),
                 &HashMap::new(),
             )
-            .unwrap_err();
-            format!("{error:#}")
+            .unwrap();
+            assert_eq!(
+                scene.profile.layers.len(),
+                1,
+                "only the front object remains"
+            );
+            scene.profile.limitations.join("\n")
         };
+        assert!(mutate(r#"{"passes":[{"depthtest":"disabled","depthwrite":"disabled","shader":"nope","textures":["back"]}]}"#)
+            .contains("unsupported scene shader \"nope\""));
+        assert!(mutate(r#"{"passes":[{"combos":{"spritesheet":1},"depthtest":"disabled","depthwrite":"disabled","shader":"genericimage","textures":["back"]}]}"#)
+            .contains("unsupported generic combo \"spritesheet\""));
+        assert!(mutate(r#"{"passes":[{"blending":"multiply","depthtest":"disabled","depthwrite":"disabled","shader":"genericimage","textures":["back"]}]}"#)
+            .contains("unsupported blending"));
+        assert!(mutate(r#"{"passes":[{"depthtest":"disabled","depthwrite":"disabled","shader":"genericimage","textures":["back"],"constantshadervalues":{"Power":-1}}]}"#)
+            .contains("nonnegative"));
+        // With every object skipped, loading fails closed and still reports why.
+        std::fs::write(
+            root.path().join("materials/glass.json"),
+            r#"{"passes":[{"depthtest":"disabled","depthwrite":"disabled","shader":"nope","textures":["front"]}]}"#,
+        )
+        .unwrap();
+        let error = load(
+            &root.path().join("scene.json"),
+            root.path(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
         assert!(
-            mutate(r#"{"passes":[{"depthtest":"disabled","depthwrite":"disabled","shader":"nope","textures":["back"]}]}"#)
-                .contains("unsupported scene shader")
+            message.contains("unsupported scene shader \"nope\""),
+            "{message}"
         );
-        assert!(
-            mutate(r#"{"passes":[{"combos":{"spritesheet":1},"depthtest":"disabled","depthwrite":"disabled","shader":"genericimage","textures":["back"]}]}"#)
-                .contains("unsupported generic combos")
-        );
-        assert!(
-            mutate(r#"{"passes":[{"blending":"multiply","depthtest":"disabled","depthwrite":"disabled","shader":"genericimage","textures":["back"]}]}"#)
-                .contains("unsupported blending")
-        );
-        assert!(
-            mutate(r#"{"passes":[{"depthtest":"disabled","depthwrite":"disabled","shader":"genericimage","textures":["back"],"constantshadervalues":{"Power":-1}}]}"#)
-                .contains("nonnegative")
-        );
+        assert!(message.contains("nonnegative"), "{message}");
     }
 }

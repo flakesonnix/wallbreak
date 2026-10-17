@@ -245,53 +245,80 @@ pub fn installation(library: &Path) -> Option<PathBuf> {
 }
 
 fn support_for(project_dir: &Path, manifest: &project::Project) -> (bool, String) {
-    match manifest.kind.as_deref() {
-        Some("video") => {
+    match manifest.resolved_kind() {
+        Some(project::ProjectKind::Video) | Some(project::ProjectKind::Image) => {
             let selected = manifest
                 .file
                 .as_deref()
-                .context("video project has no file declaration")
+                .context("project has no file declaration")
                 .and_then(|file| project::project_file(project_dir, file))
                 .and_then(|path| {
                     ensure!(
-                        project::file_kind(&path) == Some(project::MediaKind::Video),
-                        "video project must select a supported video file"
+                        matches!(
+                            project::file_kind(&path),
+                            Some(project::MediaKind::Video) | Some(project::MediaKind::Image)
+                        ),
+                        "project must select a supported image or video file"
                     );
                     Ok(path)
                 });
             match selected {
                 Ok(_) => (
                     true,
-                    "Video project; FFmpeg validates actual decodability on play.".into(),
+                    "Image/video project; FFmpeg validates actual decodability on play.".into(),
                 ),
-                Err(error) => (false, format!("Invalid video project: {error:#}")),
+                Err(error) => (false, format!("Invalid image/video project: {error:#}")),
             }
         }
-        Some("scene") => {
+        Some(project::ProjectKind::Scene) => {
             let parsed = manifest
                 .file
                 .as_deref()
                 .context("scene project has no file declaration")
-                .and_then(|file| project::project_file(project_dir, file))
-                .and_then(|scene_path| {
+                .and_then(|file| {
+                    let (scene_path, scene_root) = project::scene_selection(project_dir, file)?;
                     let colors = manifest.colors()?;
-                    scene::parse(&scene_path, project_dir, &colors)
+                    scene::parse(&scene_path, &scene_root, &colors)
                 });
             match parsed {
-                Ok(_) => (
-                    true,
-                    "Supported scene structure; textures are decoded and validated on play."
-                        .to_string(),
-                ),
+                Ok(spec) => {
+                    let partial = spec
+                        .profile
+                        .limitations
+                        .iter()
+                        .find(|limitation| limitation.starts_with("Renders "));
+                    match partial {
+                        Some(note) => (
+                            true,
+                            format!(
+                                "Partially supported scene: {note} Textures are decoded and validated on play."
+                            ),
+                        ),
+                        None => (
+                            true,
+                            "Supported scene structure; textures are decoded and validated on play."
+                                .to_string(),
+                        ),
+                    }
+                }
                 Err(error) => (false, format!("Unsupported scene: {error:#}")),
             }
         }
-        Some("web") => (false, "Web wallpapers are not supported.".to_string()),
-        Some(kind) => (false, format!("Unsupported project type {kind:?}.")),
-        None => (
+        Some(project::ProjectKind::Web) => (
             false,
-            "Project type is unknown; project.json has no type declaration.".to_string(),
+            "Web wallpaper page; rendering it requires a browser engine.".to_string(),
         ),
+        Some(project::ProjectKind::Application) => (
+            false,
+            "Application wallpaper; it executes a wallpaper binary.".to_string(),
+        ),
+        None => match manifest.kind.as_deref() {
+            Some(declared) => (false, format!("Unrecognized declared type {declared:?}.")),
+            None => (
+                false,
+                "Project type is unknown; project.json has no type declaration or recognizable file extension.".to_string(),
+            ),
+        },
     }
 }
 
@@ -303,12 +330,13 @@ pub(crate) fn project_entry(id: String, project_dir: &Path) -> Result<ProjectEnt
         .parent()
         .context("project manifest has no parent directory")?;
     let title = manifest.title.clone().unwrap_or_else(|| id.clone());
-    let kind = manifest.kind.clone().unwrap_or_else(|| "unknown".into());
+    let kind = manifest.listing_kind();
     let preview = manifest
         .preview
         .as_deref()
         .and_then(|preview| project::project_file(root, preview).ok());
     let (supported, support_note) = support_for(root, &manifest);
+    crate::log_debug!("project {id} ({title}): kind {kind}, supported={supported}: {support_note}");
     Ok(ProjectEntry {
         id,
         title,
@@ -328,6 +356,7 @@ pub fn scan(roots: &[PathBuf]) -> Vec<ProjectEntry> {
 /// Discover projects without starting another item after cancellation is observed.
 pub fn scan_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<ProjectEntry>> {
     check_cancel(cancel)?;
+    let started = std::time::Instant::now();
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
     for library in libraries_cancellable(roots, cancel)? {
@@ -335,6 +364,11 @@ pub fn scan_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<Pr
         let Some(install) = installation(&library) else {
             continue;
         };
+        crate::log_debug!(
+            "scanning library {} (installation {})",
+            library.display(),
+            install.display()
+        );
         // Workshop subscriptions.
         let workshop = library.join(format!(
             "steamapps/workshop/content/{WALLPAPER_ENGINE_APP_ID}"
@@ -353,8 +387,14 @@ pub fn scan_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<Pr
                 let id = item.file_name().to_string_lossy().into_owned();
                 if seen.insert(dir.clone()) {
                     check_cancel(cancel)?;
-                    if let Ok(entry) = project_entry(id, &dir) {
-                        entries.push(entry);
+                    match project_entry(id, &dir) {
+                        Ok(entry) => entries.push(entry),
+                        Err(error) => {
+                            crate::log_debug!(
+                                "skipping workshop item {}: {error:#}",
+                                dir.display()
+                            );
+                        }
                     }
                 }
             }
@@ -387,8 +427,14 @@ pub fn scan_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<Pr
                     }
                     let name = member.file_name().to_string_lossy().into_owned();
                     check_cancel(cancel)?;
-                    if let Ok(entry) = project_entry(format!("bundled:{name}"), &dir) {
-                        entries.push(entry);
+                    match project_entry(format!("bundled:{name}"), &dir) {
+                        Ok(entry) => entries.push(entry),
+                        Err(error) => {
+                            crate::log_debug!(
+                                "skipping bundled project {}: {error:#}",
+                                dir.display()
+                            );
+                        }
                     }
                 }
             }
@@ -397,6 +443,12 @@ pub fn scan_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<Pr
     check_cancel(cancel)?;
     entries.sort_by_key(|a| a.title.to_lowercase());
     check_cancel(cancel)?;
+    let supported = entries.iter().filter(|entry| entry.supported).count();
+    crate::log_info!(
+        "Steam scan finished in {:.1}ms: {} project(s), {supported} supported",
+        started.elapsed().as_secs_f64() * 1000.0,
+        entries.len()
+    );
     Ok(entries)
 }
 

@@ -125,6 +125,11 @@ their actual contents and codecs. Videos loop without audio. Presentation uses
 software-decoded XRGB shared memory, not GPU decoding; non-square-pixel video
 aspect correction is not implemented.
 
+Diagnostics go to stderr only when requested: the CLI's global `-v`/`-vv`/`-vvv`
+(or `WALLBREAK_LOG=error|warn|info|debug|trace` for every binary, including the
+GUI) selects the level, defaulting to `warn`. Error reports print the full cause
+chain, and decoded scene limitations are logged per scene.
+
 Without Nix, use Rust 1.88+ and FFmpeg:
 
 ```bash
@@ -140,28 +145,46 @@ with its support status, so you can pick one instead of typing paths.
 `inspect`, `check`, and `play` accept a project directory or `project.json` with
 an explicit `type: "video"` or one supported `type: "scene"` profile, plus a
 project-relative `file`. The selected media must resolve inside that project,
-including through symlinks. Unknown types, malformed JSON, parent traversal,
-missing media, and unsupported scene features fail rather than silently
-choosing another file or preview. Backslash-separated project paths are not
-supported.
+including through symlinks. Unknown types, malformed JSON, parent traversal, and
+missing media fail rather than silently choosing another file or preview.
+Backslash-separated project paths are not supported. Projects that omit `type`
+are classified from the declared file instead; web and application projects are
+reported but never executed.
+
+Packed scenes are materialized read-only: when a scene project declares
+`scene.json` but only ships a `scene.pkg` (PKGV container), the package is
+extracted into `$XDG_CACHE_HOME/wallbreak/pkg` (or `~/.cache/wallbreak/pkg`) and
+refreshed when the package changes. Entry names are validated against traversal,
+duplicates, and size budgets; nothing is executed and the project directory is
+never modified.
 
 Supported scene content: layered orthographic image quads (in-plane rotation
 allowed), composited back-to-front, with these material profiles:
 
-- `flag` with `TINT=1`, three native `.tex` textures, and the project's three
-  declared tint colors (Eagle Flag).
-- `genericimage`/`genericimage2` with default shading, one texture, optional
-  brightness/alpha/power/scroll constants, and opaque/translucent/additive
-  blending.
+- `flag` with `TINT=1`, three textures, and the project's three declared tint
+  colors (Eagle Flag).
+- `genericimage`/`genericimage2`/`genericimage4` with one rendered texture,
+  optional brightness/alpha/power/scroll constants, and
+  opaque/translucent/additive blending. Variant-only combos such as `VERSION`
+  and disabled `LIGHTING`/`REFLECTION` are accepted and reported as notes.
 - `flowimage` with two textures (base plus flow mask) or four textures (mask
   plus three parallax layers), with per-layer speeds.
 - `swayimage` with two textures (base plus sway mask).
 
-All textures must be native `.tex`; depth testing/writing must be disabled.
-Web, application, packed `scene.pkg`, scripted, particle, 3D, perspective,
-bloom, spritesheet, lighting, and other shader/material projects remain
-unsupported. For those projects, explicit `--preview` selects only the declared
-static preview and reports `preview_only: true`:
+Textures may be native `.tex` (`TEXV0005`/`TEXB0003`, RGBA8 or BC3, raw or LZ4
+mips, or packed JPEG/PNG mips) or raw PNG/JPEG/GIF/WebP/BMP images referenced
+directly; animation plays its first frame. Depth testing/writing must be
+disabled.
+
+Scene content that is not rendered is skipped per object and reported as
+limitations instead of failing the scene: 3D models, particle systems,
+text/sound/light/sprite/solid objects, camera path animation, scripted
+transforms, conditional visibility, bloom, and spritesheet or lighting
+materials. A scene fails only when nothing renderable remains. Perspective
+scenes without an orthogonal projection are approximated orthographically from
+the camera distance and reported as such. For unsupported projects, explicit
+`--preview` selects only the declared static preview and reports
+`preview_only: true`:
 
 ```bash
 project="$HOME/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach"
@@ -248,9 +271,9 @@ configuration. It checks output discovery, actual image pixels, changing video
 pixels, resize, scale, automatic stop, SIGTERM, surface removal, and, when a
 scene root is supplied, changing animated-scene pixels. It never connects to
 the existing desktop's socket. It generates its own image/video media; no
-commercial fixture is required. X11, other scene shaders, JavaScript
-scenes, packed `scene.pkg` content, interactive wallpapers, and full Wallpaper
-Engine compatibility remain unsupported.
+commercial fixture is required. X11, custom scene shaders (for example
+`cloudsbg`, `retro`, and `spritesheet` variants), JavaScript scenes, interactive
+wallpapers, and full Wallpaper Engine compatibility remain unsupported.
 
 Frames are admitted before allocation, with a 64 MiB physical-frame ceiling,
 at most three shared-memory presentation buffers, one pending presentation
