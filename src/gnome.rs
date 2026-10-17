@@ -71,9 +71,9 @@ pub fn run(
     eprintln!("GNOME static image active on all displays. Stop restores settings still owned by wallbreak.");
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed)
-        && !options
+        && options
             .duration
-            .is_some_and(|duration| started.elapsed() >= duration)
+            .is_none_or(|duration| started.elapsed() < duration)
     {
         std::thread::sleep(Duration::from_millis(50));
     }

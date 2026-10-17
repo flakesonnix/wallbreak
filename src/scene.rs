@@ -859,8 +859,7 @@ fn load_camera_paths(project_root: &Path, paths: &[String]) -> Result<(usize, f3
         let document: CameraPathDocument = read_json(&path, MAX_JSON_BYTES)?;
         ensure!(
             !document.paths.is_empty(),
-            "camera path script {} has no tracks",
-            declaration
+            "camera path script {declaration} has no tracks"
         );
         for track in &document.paths {
             ensure!(
