@@ -18,7 +18,7 @@ use wallbreak::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Image/video wallpapers plus one exact animated flag scene for Wayland layer-shell"
+    about = "Image/video and supported layered scene wallpapers for Wayland"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Resolve direct media, a video project, or one exact animated flag scene without playing it.
+    /// Resolve direct media, scene.json or a Wallpaper Engine project without playing it.
     Inspect {
         path: PathBuf,
         #[arg(long)]

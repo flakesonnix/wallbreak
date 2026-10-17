@@ -13,7 +13,6 @@
 
 use std::{
     collections::HashMap,
-    fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -23,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     media::{frame_len, Fit},
+    project::open_regular_file,
     texture::{load as load_texture, Texture},
 };
 
@@ -1167,9 +1167,11 @@ fn flow_offset(mask: &Texture, u: f32, v: f32, bias: [f32; 2], amount: f32) -> [
 /// Mask bias extracted from the project's own `shaders/flowimage.frag`.
 /// Comment lines are ignored; exactly one flow bias literal must remain.
 fn flow_bias(project_root: &Path) -> Result<[f32; 2]> {
-    let path = project_root.join("shaders/flowimage.frag");
-    let source =
-        std::fs::read_to_string(&path).with_context(|| format!("missing {}", path.display()))?;
+    let path = root_relative(project_root, "shaders/flowimage.frag")?;
+    let mut source = String::new();
+    open_regular_file(&path)?
+        .take(65_536 + 1)
+        .read_to_string(&mut source)?;
     ensure!(
         source.len() <= 65_536,
         "project flow shader exceeds the 64 KiB budget"
@@ -1221,8 +1223,7 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?
+    open_regular_file(path)?
         .take(limit + 1)
         .read_to_end(&mut bytes)?;
     ensure!(

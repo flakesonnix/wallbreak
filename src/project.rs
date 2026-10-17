@@ -23,6 +23,9 @@ pub enum MediaKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct Media {
     pub path: PathBuf,
+    /// The source file to re-resolve, distinct from its selected payload or preview.
+    #[serde(skip_serializing)]
+    pub source_path: PathBuf,
     pub kind: MediaKind,
     pub project_path: Option<PathBuf>,
     pub declared_file: Option<String>,
@@ -34,86 +37,177 @@ pub struct Media {
 }
 
 #[derive(Deserialize)]
-struct Project {
+pub(crate) struct Project {
+    #[serde(skip)]
+    pub path: PathBuf,
+    pub title: Option<String>,
     #[serde(rename = "type")]
-    kind: Option<String>,
-    file: Option<String>,
-    preview: Option<String>,
+    pub kind: Option<String>,
+    pub file: Option<String>,
+    pub preview: Option<String>,
     general: Option<ProjectGeneral>,
 }
 
 #[derive(Deserialize)]
 struct ProjectGeneral {
+    #[serde(default)]
     properties: HashMap<String, serde_json::Value>,
+}
+
+impl Project {
+    pub(crate) fn read(path: &Path) -> Result<Self> {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve project manifest {}", path.display()))?;
+        let mut bytes = Vec::new();
+        open_regular_file(&path)?
+            .take(MAX_PROJECT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_PROJECT_BYTES,
+            "project.json exceeds 1 MiB"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).context("invalid project.json")?;
+        ensure!(value.is_object(), "project.json must be a JSON object");
+        let mut project: Self = serde_json::from_value(value).context("invalid project.json")?;
+        project.path = path;
+        Ok(project)
+    }
+
+    pub(crate) fn colors(&self) -> Result<HashMap<String, [f32; 3]>> {
+        match &self.general {
+            Some(general) => scene::parse_project_colors(&general.properties),
+            None => Ok(HashMap::new()),
+        }
+    }
+}
+
+/// Attach only the adjacent manifest that actually declares this scene. A present
+/// but invalid or mismatched manifest must not be treated as an absent project.
+pub(crate) fn scene_project(scene_path: &Path) -> Result<Option<(PathBuf, Project)>> {
+    let root = scene_path
+        .parent()
+        .context("scene.json has no parent directory")?;
+    let path = root.join("project.json");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("cannot inspect scene project manifest"),
+    }
+    let project = Project::read(&path)?;
+    let root = project
+        .path
+        .parent()
+        .context("project manifest has no parent directory")?;
+    ensure!(
+        project.kind.as_deref() == Some("scene"),
+        "scene.json requires its adjacent project.json to declare type scene"
+    );
+    let declaration = project
+        .file
+        .as_deref()
+        .context("scene project has no file declaration")?;
+    ensure!(
+        project_file(root, declaration)? == scene_path,
+        "project.json does not declare the selected scene.json; refusing to select a different scene"
+    );
+    Ok(Some((project.path.clone(), project)))
 }
 
 pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
     let input = fs::canonicalize(input)
         .with_context(|| format!("cannot resolve input {}", input.display()))?;
-    let project_path = if input.is_dir() {
-        Some(input.join("project.json"))
-    } else if input.file_name().is_some_and(|name| name == "project.json") {
-        Some(input.clone())
+    let direct_scene = !input.is_dir() && file_kind(&input) == Some(MediaKind::Scene);
+    let attached = if direct_scene {
+        scene_project(&input)?
+    } else if input.is_dir()
+        || input
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        let path = if input.is_dir() {
+            input.join("project.json")
+        } else {
+            input.clone()
+        };
+        let project = Project::read(&path)?;
+        Some((project.path.clone(), project))
     } else {
-        None
-    };
-    let Some(project_path) = project_path else {
         ensure!(
             !preview,
-            "--preview requires a project directory or project.json"
+            "--preview requires a project directory, project.json or a project-backed scene.json"
         );
-        return media(input, None, None, false);
+        return media(input.clone(), input, None, None, false);
     };
-
-    let mut bytes = Vec::new();
-    File::open(&project_path)
-        .with_context(|| format!("cannot open {}", project_path.display()))?
-        .take(MAX_PROJECT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_PROJECT_BYTES,
-        "project.json exceeds 1 MiB"
-    );
-    let project: Project = serde_json::from_slice(&bytes).context("invalid project.json")?;
-    let declared_file = if preview {
-        project
-            .preview
-            .context("project has no preview declaration")?
+    let (project_path, project) = attached.unzip();
+    let source_path = if direct_scene {
+        input.clone()
     } else {
+        project_path.clone().context("project source is missing")?
+    };
+    let root = project_path
+        .as_deref()
+        .unwrap_or(&source_path)
+        .parent()
+        .context("source has no parent directory")?;
+    let declared_file = if preview {
+        Some(
+            project
+                .as_ref()
+                .context("standalone scene.json has no declared project preview")?
+                .preview
+                .clone()
+                .context("project has no preview declaration")?,
+        )
+    } else if let Some(project) = &project {
         match project.kind.as_deref() {
             Some("video") | Some("scene") => {
-                project.file.context("project has no file declaration")?
+                Some(project.file.clone().context("project has no file declaration")?)
             }
             Some(kind) => bail!(
-                "project type {kind:?} is unsupported: this MVP plays images/videos and one exact flag scene, not web pages or executables; use --preview explicitly for its static preview"
+                "project type {kind:?} is unsupported: this player supports images/videos and supported layered scenes, not web pages or executables; use --preview explicitly for its static preview"
             ),
             None => bail!("project type is unknown; use an explicit media file or --preview"),
         }
+    } else {
+        None
     };
-    let root = project_path
-        .parent()
-        .context("project has no parent directory")?;
-    let selected = project_file(root, &declared_file)?;
-    if !preview && project.kind.as_deref() == Some("scene") {
-        let properties = project
-            .general
-            .context("scene project has no general properties")?;
-        let colors = scene::parse_project_colors(&properties.properties)?;
+    let selected = if direct_scene && !preview {
+        input
+    } else {
+        match &declared_file {
+            Some(declaration) => project_file(root, declaration)?,
+            None => input,
+        }
+    };
+    if !preview
+        && (direct_scene
+            || project
+                .as_ref()
+                .is_some_and(|project| project.kind.as_deref() == Some("scene")))
+    {
+        let colors = project
+            .as_ref()
+            .map(Project::colors)
+            .transpose()?
+            .unwrap_or_default();
         let scene = scene::load(&selected, root, &colors)?;
         let profile = scene.profile().clone();
         let limitations = profile.limitations.clone();
         return Ok(Media {
             path: selected,
+            source_path,
             kind: MediaKind::Scene,
-            project_path: Some(project_path),
-            declared_file: Some(declared_file),
+            project_path,
+            declared_file,
             preview_only: false,
             scene: Some(scene),
             scene_profile: Some(profile),
             limitations,
         });
     }
-    let resolved = media(selected, Some(project_path), Some(declared_file), preview)?;
+    let resolved = media(selected, source_path, project_path, declared_file, preview)?;
     if preview {
         ensure!(
             resolved.kind == MediaKind::Image,
@@ -128,7 +222,27 @@ pub fn resolve(input: &Path, preview: bool) -> Result<Media> {
     Ok(resolved)
 }
 
-fn project_file(root: &Path, declaration: &str) -> Result<PathBuf> {
+pub(crate) fn open_regular_file(path: &Path) -> Result<File> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    // Nonblocking open lets us inspect and reject FIFOs before any read.
+    let file = File::from(
+        open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .with_context(|| format!("cannot open {}", path.display()))?,
+    );
+    ensure!(
+        file.metadata()?.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    Ok(file)
+}
+
+pub(crate) fn project_file(root: &Path, declaration: &str) -> Result<PathBuf> {
     let relative = Path::new(declaration);
     ensure!(
         !declaration.is_empty()
@@ -149,28 +263,49 @@ fn project_file(root: &Path, declaration: &str) -> Result<PathBuf> {
     Ok(selected)
 }
 
-fn media(
-    path: PathBuf,
-    project_path: Option<PathBuf>,
-    declared_file: Option<String>,
-    preview: bool,
-) -> Result<Media> {
-    ensure!(path.is_file(), "media must be a regular file");
+pub fn file_kind(path: &Path) -> Option<MediaKind> {
+    if path.file_name().is_some_and(|name| name == "scene.json") {
+        return Some(MediaKind::Scene);
+    }
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let (kind, mut limitations) = match extension.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" => (
+    match extension.as_str() {
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" => Some(MediaKind::Image),
+        "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" | "ogv" | "wmv" | "mpg" | "mpeg" => {
+            Some(MediaKind::Video)
+        }
+        _ => None,
+    }
+}
+
+fn media(
+    path: PathBuf,
+    source_path: PathBuf,
+    project_path: Option<PathBuf>,
+    declared_file: Option<String>,
+    preview: bool,
+) -> Result<Media> {
+    ensure!(path.is_file(), "media must be a regular file");
+    let (kind, mut limitations) = match file_kind(&path) {
+        Some(MediaKind::Image) => (
             MediaKind::Image,
             vec!["Images are decoded as a single static frame; animation and EXIF rotation are not applied.".into()],
         ),
-        "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" | "ogv" | "wmv" | "mpg" | "mpeg" => (
+        Some(MediaKind::Video) => (
             MediaKind::Video,
             vec!["Video kind is selected by extension; FFmpeg validates actual decodability. Playback is muted, software-decoded, and looped.".into()],
         ),
-        _ => bail!("unsupported media extension {extension:?}; select a supported image or video, not scene.pkg or scene.json"),
+        _ => {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            bail!("unsupported media extension {extension:?}; select a supported image, video or scene.json, not a packed scene.pkg")
+        }
     };
     if preview {
         limitations.push(
@@ -180,6 +315,7 @@ fn media(
     }
     Ok(Media {
         path,
+        source_path,
         kind,
         project_path,
         declared_file,

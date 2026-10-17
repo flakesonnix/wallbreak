@@ -213,9 +213,9 @@ impl Animation {
                 }
                 ensure!(
                     args.source.is_file(),
-                    "--source must be a regular media file or project.json"
+                    "--source must be a regular media file, project.json or scene.json"
                 );
-                // Resolve the caller's original project.json, never its scene payload/preview.
+                // Re-resolve the selected source, not a substituted project or preview.
                 let media = project::resolve(&args.source, false)?;
                 if cancelled.load(Ordering::Relaxed) {
                     return Ok(());

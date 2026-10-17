@@ -2,20 +2,20 @@
 //!
 //! Scans local Steam libraries for the Wallpaper Engine app (431960) and lists
 //! its workshop items and bundled projects. Only public `project.json`
-//! declarations (title, type, file, preview) are read; no account data, no
-//! workshop metadata, and nothing is executed or modified.
+//! declarations and scene structure are read; no account data, no workshop
+//! metadata, and nothing is decoded, executed, or modified.
 
 use std::{
     collections::HashSet,
-    fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 
-use crate::scene;
+use crate::{project, scene};
 
 /// Wallpaper Engine's Steam app ID.
 pub const WALLPAPER_ENGINE_APP_ID: &str = "431960";
@@ -29,7 +29,7 @@ pub struct ProjectEntry {
     pub title: String,
     /// Declared project type: `scene`, `video`, `web`, or `unknown`.
     pub kind: String,
-    /// Absolute project directory.
+    /// Absolute project directory, or explicitly selected local media file.
     pub path: PathBuf,
     pub preview: Option<PathBuf>,
     /// Whether wallbreak can play this project now.
@@ -160,20 +160,6 @@ fn library_paths(document: &Vdf) -> Vec<PathBuf> {
     paths
 }
 
-fn read_json(path: &Path) -> Result<serde_json::Value> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?
-        .take(MAX_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= MAX_JSON_BYTES,
-        "{} exceeds the JSON budget",
-        path.display()
-    );
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid {}", path.display()))
-}
-
 /// Candidate Steam roots on this machine, deduplicated best-effort.
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -196,9 +182,19 @@ pub fn default_roots() -> Vec<PathBuf> {
 
 /// Library directories from every `libraryfolders.vdf` under the given roots.
 pub fn libraries(roots: &[PathBuf]) -> Vec<PathBuf> {
+    libraries_cancellable(roots, &AtomicBool::new(false)).unwrap_or_default()
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Steam scan cancelled");
+    Ok(())
+}
+
+fn libraries_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
     let mut libraries = Vec::new();
     let mut seen = HashSet::new();
     for root in roots {
+        check_cancel(cancel)?;
         // The root itself is usually a library.
         if root.join("steamapps").is_dir() && seen.insert(root.clone()) {
             libraries.push(root.clone());
@@ -207,20 +203,33 @@ pub fn libraries(roots: &[PathBuf]) -> Vec<PathBuf> {
             root.join("steamapps/libraryfolders.vdf"),
             root.join("config/libraryfolders.vdf"),
         ] {
-            let Ok(text) = std::fs::read_to_string(&manifest) else {
+            check_cancel(cancel)?;
+            let Ok(file) = project::open_regular_file(&manifest) else {
                 continue;
             };
+            let mut text = String::new();
+            if file
+                .take(MAX_JSON_BYTES + 1)
+                .read_to_string(&mut text)
+                .is_err()
+                || text.len() as u64 > MAX_JSON_BYTES
+            {
+                continue;
+            }
+            check_cancel(cancel)?;
             let Ok(document) = parse_vdf(&text) else {
                 continue;
             };
             for path in library_paths(&document) {
+                check_cancel(cancel)?;
                 if path.join("steamapps").is_dir() && seen.insert(path.clone()) {
                     libraries.push(path);
                 }
             }
         }
     }
-    libraries
+    check_cancel(cancel)?;
+    Ok(libraries)
 }
 
 /// Wallpaper Engine installation directory inside one library, if present.
@@ -235,79 +244,72 @@ pub fn installation(library: &Path) -> Option<PathBuf> {
     install.is_dir().then_some(install)
 }
 
-fn support_for(project_dir: &Path, manifest: &serde_json::Value) -> (bool, String) {
-    let kind = manifest
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let file = manifest
-        .get("file")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    match kind {
-        "video" if !file.is_empty() => (
-            true,
-            "Video project; FFmpeg validates the actual media on play.".to_string(),
-        ),
-        "scene" if !file.is_empty() => {
-            let properties = manifest
-                .get("general")
-                .and_then(|general| general.get("properties"))
-                .and_then(|properties| properties.as_object());
-            let Some(properties) = properties else {
-                return (false, "Scene project without color properties.".to_string());
-            };
-            let colors: std::collections::HashMap<String, serde_json::Value> = properties
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            let Ok(colors) = scene::parse_project_colors(&colors) else {
-                return (
-                    false,
-                    "Scene project without the three flag tint colors.".to_string(),
-                );
-            };
-            let scene_path = project_dir.join(file);
-            match scene::parse(&scene_path, project_dir, &colors) {
-                Ok(_) => (true, "Supported animated flag scene.".to_string()),
-                Err(error) => (
-                    false,
-                    format!(
-                        "Unsupported scene: {:#}",
-                        error
-                            .to_string()
-                            .split(':')
-                            .next()
-                            .unwrap_or("unknown feature")
-                    ),
+fn support_for(project_dir: &Path, manifest: &project::Project) -> (bool, String) {
+    match manifest.kind.as_deref() {
+        Some("video") => {
+            let selected = manifest
+                .file
+                .as_deref()
+                .context("video project has no file declaration")
+                .and_then(|file| project::project_file(project_dir, file))
+                .and_then(|path| {
+                    ensure!(
+                        project::file_kind(&path) == Some(project::MediaKind::Video),
+                        "video project must select a supported video file"
+                    );
+                    Ok(path)
+                });
+            match selected {
+                Ok(_) => (
+                    true,
+                    "Video project; FFmpeg validates actual decodability on play.".into(),
                 ),
+                Err(error) => (false, format!("Invalid video project: {error:#}")),
             }
         }
-        "web" => (false, "Web wallpapers are not supported.".to_string()),
-        _ => (false, "Unknown or unsupported project type.".to_string()),
+        Some("scene") => {
+            let parsed = manifest
+                .file
+                .as_deref()
+                .context("scene project has no file declaration")
+                .and_then(|file| project::project_file(project_dir, file))
+                .and_then(|scene_path| {
+                    let colors = manifest.colors()?;
+                    scene::parse(&scene_path, project_dir, &colors)
+                });
+            match parsed {
+                Ok(_) => (
+                    true,
+                    "Supported scene structure; textures are decoded and validated on play."
+                        .to_string(),
+                ),
+                Err(error) => (false, format!("Unsupported scene: {error:#}")),
+            }
+        }
+        Some("web") => (false, "Web wallpapers are not supported.".to_string()),
+        Some(kind) => (false, format!("Unsupported project type {kind:?}.")),
+        None => (
+            false,
+            "Project type is unknown; project.json has no type declaration.".to_string(),
+        ),
     }
 }
 
-fn entry(id: String, project_dir: &Path) -> Option<ProjectEntry> {
+pub(crate) fn project_entry(id: String, project_dir: &Path) -> Result<ProjectEntry> {
     let manifest_path = project_dir.join("project.json");
-    let manifest = read_json(&manifest_path).ok()?;
-    let title = manifest
-        .get("title")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&id)
-        .to_string();
-    let kind = manifest
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
+    let manifest = project::Project::read(&manifest_path)?;
+    let root = manifest
+        .path
+        .parent()
+        .context("project manifest has no parent directory")?;
+    let title = manifest.title.clone().unwrap_or_else(|| id.clone());
+    let kind = manifest.kind.clone().unwrap_or_else(|| "unknown".into());
     let preview = manifest
-        .get("preview")
-        .and_then(serde_json::Value::as_str)
-        .map(|preview| project_dir.join(preview))
-        .filter(|path| path.is_file());
-    let (supported, support_note) = support_for(project_dir, &manifest);
-    Some(ProjectEntry {
+        .preview
+        .as_deref()
+        .and_then(|preview| project::project_file(root, preview).ok());
+    let (supported, support_note) = support_for(root, &manifest);
+    Ok(ProjectEntry {
         id,
         title,
         kind,
@@ -320,9 +322,16 @@ fn entry(id: String, project_dir: &Path) -> Option<ProjectEntry> {
 
 /// All Wallpaper Engine projects: workshop items plus bundled projects.
 pub fn scan(roots: &[PathBuf]) -> Vec<ProjectEntry> {
+    scan_cancellable(roots, &AtomicBool::new(false)).unwrap_or_default()
+}
+
+/// Discover projects without starting another item after cancellation is observed.
+pub fn scan_cancellable(roots: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<ProjectEntry>> {
+    check_cancel(cancel)?;
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    for library in libraries(roots) {
+    for library in libraries_cancellable(roots, cancel)? {
+        check_cancel(cancel)?;
         let Some(install) = installation(&library) else {
             continue;
         };
@@ -330,15 +339,21 @@ pub fn scan(roots: &[PathBuf]) -> Vec<ProjectEntry> {
         let workshop = library.join(format!(
             "steamapps/workshop/content/{WALLPAPER_ENGINE_APP_ID}"
         ));
+        check_cancel(cancel)?;
         if let Ok(items) = std::fs::read_dir(&workshop) {
-            for item in items.flatten() {
+            for item in items {
+                check_cancel(cancel)?;
+                let Ok(item) = item else {
+                    continue;
+                };
                 let dir = item.path();
                 if !dir.is_dir() {
                     continue;
                 }
                 let id = item.file_name().to_string_lossy().into_owned();
                 if seen.insert(dir.clone()) {
-                    if let Some(entry) = entry(id, &dir) {
+                    check_cancel(cancel)?;
+                    if let Ok(entry) = project_entry(id, &dir) {
                         entries.push(entry);
                     }
                 }
@@ -346,30 +361,43 @@ pub fn scan(roots: &[PathBuf]) -> Vec<ProjectEntry> {
         }
         // Bundled and user projects shipped with the installation.
         let projects = install.join("projects");
+        check_cancel(cancel)?;
         if let Ok(collections) = std::fs::read_dir(&projects) {
-            for collection in collections.flatten() {
+            for collection in collections {
+                check_cancel(cancel)?;
+                let Ok(collection) = collection else {
+                    continue;
+                };
                 let collection = collection.path();
                 if !collection.is_dir() {
                     continue;
                 }
+                check_cancel(cancel)?;
                 let Ok(members) = std::fs::read_dir(&collection) else {
                     continue;
                 };
-                for member in members.flatten() {
+                for member in members {
+                    check_cancel(cancel)?;
+                    let Ok(member) = member else {
+                        continue;
+                    };
                     let dir = member.path();
                     if !dir.is_dir() || !seen.insert(dir.clone()) {
                         continue;
                     }
                     let name = member.file_name().to_string_lossy().into_owned();
-                    if let Some(entry) = entry(format!("bundled:{name}"), &dir) {
+                    check_cancel(cancel)?;
+                    if let Ok(entry) = project_entry(format!("bundled:{name}"), &dir) {
                         entries.push(entry);
                     }
                 }
             }
         }
     }
+    check_cancel(cancel)?;
     entries.sort_by_key(|a| a.title.to_lowercase());
-    entries
+    check_cancel(cancel)?;
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -437,6 +465,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            steamapps.join("common/wallpaper_engine/projects/bundled/demo/clip.mp4"),
+            b"structural discovery does not decode media",
+        )
+        .unwrap();
+        std::fs::write(
             steamapps.join("workshop/content/431960/777/project.json"),
             r#"{"title":"Workshop Page","type":"web","file":"index.html"}"#,
         )
@@ -492,8 +525,7 @@ mod tests {
         for stem in ["a", "b", "c"] {
             std::fs::write(project.join(format!("materials/{stem}.tex")), b"").unwrap();
         }
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(project.join("project.json")).unwrap()).unwrap();
+        let manifest = project::Project::read(&project.join("project.json")).unwrap();
         let (supported, _) = support_for(&project, &manifest);
         // Texture files are absent, yet structural support is detected.
         assert!(supported);

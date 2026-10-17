@@ -140,7 +140,7 @@ fn run_connected(
         Path::new(renderer).is_file(),
         "GNOME animation renderer is missing: {renderer}; install the wallbreak-renderer public wrapper beside wallbreak"
     );
-    let source = media.project_path.as_deref().unwrap_or(&media.path);
+    let source = &media.source_path;
     ensure!(
         source.is_absolute(),
         "GNOME animation source path must be absolute"

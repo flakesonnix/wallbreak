@@ -400,6 +400,7 @@ mod tests {
         )
         .unwrap();
         fixture.media.project_path = Some(project.clone());
+        fixture.media.source_path = project.clone();
         fixture.media.kind = project::MediaKind::Scene;
         fixture
             .run(&options(), Some("DP-1 literal #?"), cancelled())
@@ -713,12 +714,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("FFmpeg path is not UTF-8"));
-        fixture.media.project_path = Some(
-            fixture
-                ._directory
-                .path()
-                .join(std::ffi::OsString::from_vec(vec![0xff])),
-        );
+        fixture.media.source_path = fixture
+            ._directory
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![0xff]));
         assert!(fixture
             .run(&options(), None, cancelled())
             .unwrap_err()
