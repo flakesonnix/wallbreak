@@ -293,10 +293,8 @@ fn partial_first_frame_reports_the_decoder_failure_without_mapping_a_window() {
 #[test]
 fn native_setup_failure_after_a_complete_frame_still_reaps_the_decoder() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut renderer, bridge, pid_file, log) = decoder_renderer(
-        directory.path(),
-        "printf '\\003\\021\\361\\377'; exec sleep 60",
-    );
+    let (mut renderer, bridge, pid_file, log) =
+        decoder_renderer(directory.path(), "printf '\\076\\146\\357'; exec sleep 60");
     // Close our private peer, not a real compositor. Native setup must fail closed.
     drop(bridge);
     assert!(!renderer.wait(Duration::from_secs(5)).success());

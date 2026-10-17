@@ -123,9 +123,9 @@ pub struct Scene {
 }
 
 #[derive(Debug, Clone)]
-struct LayerRuntime {
-    geometry: LayerGeometry,
-    material: MaterialRuntime,
+pub(crate) struct LayerRuntime {
+    pub(crate) geometry: LayerGeometry,
+    pub(crate) material: MaterialRuntime,
 }
 
 impl MaterialProfile {
@@ -141,7 +141,7 @@ impl MaterialProfile {
 }
 
 #[derive(Debug, Clone)]
-enum MaterialRuntime {
+pub(crate) enum MaterialRuntime {
     Flag {
         colors: FlagColors,
         speed: f32,
@@ -271,10 +271,10 @@ pub struct FlagColors {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SceneLayout {
-    factor: f64,
-    left: f64,
-    top: f64,
+pub(crate) struct SceneLayout {
+    pub(crate) factor: f64,
+    pub(crate) left: f64,
+    pub(crate) top: f64,
 }
 
 /// Layer compositing: Opaque replaces, Translucent uses straight alpha
@@ -1377,25 +1377,37 @@ fn render_threads(height: u32) -> usize {
     parallelism.clamp(1, 8).min(height.max(1) as usize).max(1)
 }
 
+/// Fit one scene projection into the output, shared by the CPU and GPU paths.
+pub(crate) fn scene_layout(
+    projection: [u32; 2],
+    width: u32,
+    height: u32,
+    fit: Fit,
+) -> Result<SceneLayout> {
+    let (scene_width, scene_height) = (f64::from(projection[0]), f64::from(projection[1]));
+    let factor = match fit {
+        Fit::Cover => (f64::from(width) / scene_width).max(f64::from(height) / scene_height),
+        Fit::Contain => (f64::from(width) / scene_width).min(f64::from(height) / scene_height),
+    };
+    ensure!(
+        factor.is_finite() && factor > 0.0,
+        "invalid scene fit scale"
+    );
+    Ok(SceneLayout {
+        factor,
+        left: (f64::from(width) - scene_width * factor) / 2.0,
+        top: (f64::from(height) - scene_height * factor) / 2.0,
+    })
+}
+
 impl Scene {
+    #[cfg(feature = "gui")]
+    pub(crate) fn runtime_layers(&self) -> &[LayerRuntime] {
+        &self.layers
+    }
+
     fn layout(&self, width: u32, height: u32, fit: Fit) -> Result<SceneLayout> {
-        let (scene_width, scene_height) = (
-            f64::from(self.profile.projection[0]),
-            f64::from(self.profile.projection[1]),
-        );
-        let factor = match fit {
-            Fit::Cover => (f64::from(width) / scene_width).max(f64::from(height) / scene_height),
-            Fit::Contain => (f64::from(width) / scene_width).min(f64::from(height) / scene_height),
-        };
-        ensure!(
-            factor.is_finite() && factor > 0.0,
-            "invalid scene fit scale"
-        );
-        Ok(SceneLayout {
-            factor,
-            left: (f64::from(width) - scene_width * factor) / 2.0,
-            top: (f64::from(height) - scene_height * factor) / 2.0,
-        })
+        scene_layout(self.profile.projection, width, height, fit)
     }
 
     fn render_rows(
@@ -1514,7 +1526,7 @@ impl Scene {
 }
 
 impl MaterialRuntime {
-    fn blending(&self) -> Blending {
+    pub(crate) fn blending(&self) -> Blending {
         match self {
             MaterialRuntime::Flag { .. } => Blending::Opaque,
             MaterialRuntime::Generic { blending, .. } => *blending,
@@ -1542,10 +1554,7 @@ impl MaterialRuntime {
             } => {
                 // Signed-square scroll preserves continuity through zero; the
                 // shipped GLSL pow() on negative bases is undefined behavior.
-                let scroll = [
-                    scroll[0].signum() * scroll[0] * scroll[0],
-                    scroll[1].signum() * scroll[1] * scroll[1],
-                ];
+                let scroll = runtime_scroll(*scroll);
                 let sample = tex.sample_repeat(u + time * scroll[0], v + time * scroll[1]);
                 if *power == 1.0 {
                     [
@@ -1702,6 +1711,15 @@ fn flow_bias(project_root: &Path) -> Result<[f32; 2]> {
 
 fn fract(value: f32) -> f32 {
     value - value.floor()
+}
+
+/// Signed-square scroll preserves continuity through zero; the shipped GLSL
+/// pow() on negative bases is undefined behavior. Shared with the GPU path.
+pub(crate) fn runtime_scroll(scroll: [f32; 2]) -> [f32; 2] {
+    [
+        scroll[0].signum() * scroll[0] * scroll[0],
+        scroll[1].signum() * scroll[1] * scroll[1],
+    ]
 }
 
 fn mix4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {

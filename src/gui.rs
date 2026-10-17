@@ -387,7 +387,7 @@ fn render_preview_cancellable(
     let frame = loop {
         anyhow::ensure!(!cancel.load(Ordering::Relaxed), "preview cancelled");
         if let Some(frame) = worker.take_frame()? {
-            break frame;
+            break frame.into_bgra()?;
         }
         anyhow::ensure!(
             start.elapsed() <= Duration::from_secs(15),

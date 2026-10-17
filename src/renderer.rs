@@ -1,4 +1,7 @@
 //! Ordinary, bridge-owned Wayland source window for GNOME animation clones.
+//!
+//! Scene, image, and video content is uploaded and drawn on the GPU through the
+//! window's own glow context; only video frames are still decoded on the CPU.
 
 use std::{
     cell::RefCell,
@@ -7,8 +10,8 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
-        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError},
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -16,18 +19,20 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
-use eframe::egui;
+use eframe::{egui, egui_glow, glow};
 
 use crate::{
-    gui::bgra_to_rgba,
-    media::{frame_len, Fit, MediaWorker, PlaybackOptions},
+    gpu::{Clock, GpuImage, GpuScene, GpuVideo, Renderer},
+    media::{decode_image, frame_len, Fit, Frame, MediaWorker, PlaybackOptions, Yuv420Frame},
     project,
+    scene::Scene,
 };
 
 pub const APP_ID: &str = "io.github.flakesonnix.wallbreak.Renderer";
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const FIRST_FRAME_POLL: Duration = Duration::from_millis(5);
+const VIDEO_POLL: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -140,17 +145,6 @@ fn require_owned_socket() -> Result<()> {
     Ok(())
 }
 
-fn frame_image(frame: &[u8], width: u32, height: u32) -> Result<egui::ColorImage> {
-    ensure!(
-        frame.len() == frame_len(width, height)?,
-        "decoder returned an incomplete or incorrectly sized BGRA frame"
-    );
-    Ok(egui::ColorImage::from_rgba_unmultiplied(
-        [width as usize, height as usize],
-        &bgra_to_rgba(frame),
-    ))
-}
-
 fn with_cleanup(result: Result<()>, cleanup: Result<()>) -> Result<()> {
     match (result, cleanup) {
         (Ok(()), cleanup) => cleanup,
@@ -163,36 +157,147 @@ fn with_cleanup(result: Result<()>, cleanup: Result<()>) -> Result<()> {
 
 /// Run only with the private Wayland descriptor inherited from the native bridge.
 /// Signal handlers set `close`; the GUI closes normally and all workers are joined.
-/// An in-progress MediaWorker CPU render is not preemptible and must finish to join.
+/// FFmpeg is stopped and reaped on exit; in-progress image/scene loading must
+/// finish before its preparation worker can be joined.
 pub fn run(args: Args, close: Arc<AtomicBool>) -> Result<()> {
     args.validate()?;
     require_owned_socket()?;
     let options = args.native_options();
     let outcome = Rc::new(RefCell::new(Ok(())));
     let mut app = Animation::start(args, close, outcome.clone())?;
-    let result = (|| {
-        let Some(first) = app.first_frame(FIRST_FRAME_TIMEOUT)? else {
-            return Ok(());
-        };
-        app.first = Some(first);
-        if app.close.load(Ordering::Relaxed) {
-            return Ok(());
+    let result = match app.first_frame(FIRST_FRAME_TIMEOUT) {
+        Ok(Some(source)) if !app.close.load(Ordering::Relaxed) => {
+            app.source = Some(Arc::new(source));
+            eframe::run_native(APP_ID, options, Box::new(move |_cc| Ok(Box::new(app)))).map_err(
+                |error| anyhow::anyhow!("renderer window/Wayland connection failed: {error}"),
+            )
         }
-        eframe::run_native(APP_ID, options, Box::new(move |_cc| Ok(Box::new(app))))
-            .map_err(|error| anyhow::anyhow!("renderer window/Wayland connection failed: {error}"))
-    })();
-    // The app (or the unused app-creator on window setup failure) has been dropped.
+        result => {
+            drop(app);
+            result.map(|_| ())
+        }
+    };
+    // Every branch has dropped the app before consuming its cleanup outcome.
     with_cleanup(result, outcome.replace(Ok(())))
+}
+
+#[derive(Default)]
+struct LatestVideo {
+    frame: Option<Yuv420Frame>,
+    error: Option<String>,
+}
+
+/// One resolved source, shared with the paint callback.
+enum Source {
+    Scene { scene: Arc<Scene>, clock: Clock },
+    Image(image::RgbaImage),
+    Video { latest: Arc<Mutex<LatestVideo>> },
+}
+
+/// A resolved source plus the decoder handle the app must keep joining.
+enum Ready {
+    Cancelled,
+    Content(Source),
+    Video {
+        latest: Arc<Mutex<LatestVideo>>,
+        decoder: JoinHandle<Result<()>>,
+    },
+}
+
+/// GL objects created inside the paint callback on first use.
+#[derive(Default)]
+struct GpuState {
+    renderer: Option<Renderer>,
+    scene: Option<GpuScene>,
+    image: Option<GpuImage>,
+    video: Option<GpuVideo>,
+}
+
+fn draw_content(
+    gl: &glow::Context,
+    state: &Mutex<GpuState>,
+    source: &Source,
+    fit: Fit,
+    info: egui::PaintCallbackInfo,
+) -> Result<()> {
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("GPU state was poisoned"))?;
+    if state.renderer.is_none() {
+        state.renderer = Some(Renderer::new(gl).context("GPU renderer initialization failed")?);
+    }
+    let GpuState {
+        renderer,
+        scene,
+        image,
+        video,
+    } = &mut *state;
+    let renderer = renderer.as_ref().unwrap();
+    let viewport = info.viewport_in_pixels();
+    let width = u32::try_from(viewport.width_px).context("paint viewport has no width")?;
+    let height = u32::try_from(viewport.height_px).context("paint viewport has no height")?;
+    match source {
+        Source::Scene {
+            scene: source_scene,
+            clock,
+        } => {
+            if scene.is_none() {
+                *scene =
+                    Some(GpuScene::new(gl, source_scene).context("scene texture upload failed")?);
+            }
+            renderer
+                .draw_scene(
+                    gl,
+                    scene.as_ref().unwrap(),
+                    clock.elapsed(),
+                    width,
+                    height,
+                    fit,
+                )
+                .context("scene draw failed")?;
+        }
+        Source::Image(source_image) => {
+            if image.is_none() {
+                *image =
+                    Some(GpuImage::new(gl, source_image).context("image texture upload failed")?);
+            }
+            renderer
+                .draw_image(gl, image.as_ref().unwrap(), width, height, fit)
+                .context("image draw failed")?;
+        }
+        Source::Video { latest } => {
+            if video.is_none() {
+                *video = Some(GpuVideo::new(gl).context("video texture setup failed")?);
+            }
+            let frame = latest
+                .lock()
+                .map_err(|_| anyhow::anyhow!("video frame state was poisoned"))?
+                .frame
+                .take();
+            if let Some(frame) = frame {
+                video
+                    .as_mut()
+                    .unwrap()
+                    .upload(gl, &frame)
+                    .context("video frame upload failed")?;
+            }
+            renderer
+                .draw_video(gl, video.as_ref().unwrap())
+                .context("video draw failed")?;
+        }
+    }
+    Ok(())
 }
 
 struct Animation {
     close: Arc<AtomicBool>,
-    worker: Option<JoinHandle<Result<()>>>,
-    requests: SyncSender<()>,
-    frames: Receiver<Option<egui::ColorImage>>,
-    in_flight: bool,
-    first: Option<egui::ColorImage>,
-    texture: Option<egui::TextureHandle>,
+    preparation: Option<JoinHandle<Result<Ready>>>,
+    decoder: Option<JoinHandle<Result<()>>>,
+    ready: Receiver<()>,
+    source: Option<Arc<Source>>,
+    gpu: Arc<Mutex<GpuState>>,
+    gpu_error: Arc<Mutex<Option<String>>>,
+    fit: Fit,
     interval: Duration,
     next_frame: Instant,
     outcome: Rc<RefCell<Result<()>>>,
@@ -202,83 +307,78 @@ impl Animation {
     fn start(args: Args, close: Arc<AtomicBool>, outcome: Rc<RefCell<Result<()>>>) -> Result<Self> {
         args.validate()?;
         let interval = Duration::from_secs_f64(1.0 / f64::from(args.fps));
-        let (requests, receive_request) = mpsc::sync_channel(1);
-        let (send_frame, frames) = mpsc::sync_channel(1);
+        let (send_ready, ready) = mpsc::sync_channel(1);
         let cancelled = close.clone();
-        let worker = thread::Builder::new()
-            .name("animation-frames".into())
+        let preparation = thread::Builder::new()
+            .name("animation-source".into())
             .spawn(move || {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                ensure!(
-                    args.source.is_file(),
-                    "--source must be a regular media file, project.json or scene.json"
-                );
-                // Re-resolve the selected source, not a substituted project or preview.
-                let media = project::resolve(&args.source, false)?;
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                let options = PlaybackOptions {
-                    fps: args.fps,
-                    fit: args.fit,
-                    ffmpeg: args.ffmpeg,
-                    duration: None,
-                };
-                let mut worker = MediaWorker::start(&media, args.width, args.height, &options)?;
-                let result = (|| {
-                    while !cancelled.load(Ordering::Relaxed) {
-                        match receive_request.recv_timeout(CANCEL_POLL) {
-                            Ok(()) => {}
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Err(RecvTimeoutError::Disconnected) => break,
+                let result = (|| -> Result<Ready> {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(Ready::Cancelled);
+                    }
+                    ensure!(
+                        args.source.is_file(),
+                        "--source must be a regular media file, project.json or scene.json"
+                    );
+                    // Re-resolve the selected source, not a substituted project or preview.
+                    let media = project::resolve(&args.source, false)?;
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(Ready::Cancelled);
+                    }
+                    match media.kind {
+                        project::MediaKind::Scene => {
+                            let scene = media
+                                .scene
+                                .clone()
+                                .context("scene selection is missing its validated renderer")?;
+                            Ok(Ready::Content(Source::Scene {
+                                scene: Arc::new(scene),
+                                clock: Clock::start(),
+                            }))
                         }
-                        if cancelled.load(Ordering::Relaxed) {
-                            break;
+                        project::MediaKind::Image => {
+                            Ok(Ready::Content(Source::Image(decode_image(&media.path)?)))
                         }
-                        let frame = worker.take_frame()?;
-                        if cancelled.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let image = frame
-                            .map(|frame| frame_image(&frame, args.width, args.height))
-                            .transpose()?;
-                        // One outstanding request bounds retained frames and never stalls the UI.
-                        if send_frame.send(image).is_err() {
-                            break;
+                        _ => {
+                            let options = PlaybackOptions {
+                                fps: args.fps,
+                                fit: args.fit,
+                                ffmpeg: args.ffmpeg.clone(),
+                                duration: None,
+                            };
+                            let (latest, decoder) = start_video_decoder(
+                                media,
+                                args.width,
+                                args.height,
+                                options,
+                                cancelled.clone(),
+                            )?;
+                            Ok(Ready::Video { latest, decoder })
                         }
                     }
-                    Ok(())
                 })();
-                with_cleanup(result, worker.shutdown())
+                // Only signal readiness here. The join handle remains the sole
+                // owner of the result, including any decoder that needs joining.
+                let _ = send_ready.send(());
+                result
             })
-            .context("cannot start animation frame worker")?;
+            .context("cannot start animation source worker")?;
         Ok(Self {
             close,
-            worker: Some(worker),
-            requests,
-            frames,
-            in_flight: false,
-            first: None,
-            texture: None,
+            preparation: Some(preparation),
+            decoder: None,
+            ready,
+            source: None,
+            gpu: Arc::new(Mutex::new(GpuState::default())),
+            gpu_error: Arc::new(Mutex::new(None)),
+            fit: args.fit,
             interval,
             next_frame: Instant::now(),
             outcome,
         })
     }
 
-    fn request_frame(&mut self) -> Result<()> {
-        if !self.in_flight {
-            self.requests
-                .try_send(())
-                .context("animation frame worker stopped")?;
-            self.in_flight = true;
-        }
-        Ok(())
-    }
-
-    fn first_frame(&mut self, timeout: Duration) -> Result<Option<egui::ColorImage>> {
+    fn first_frame(&mut self, timeout: Duration) -> Result<Option<Source>> {
         let deadline = Instant::now() + timeout;
         loop {
             if self.close.load(Ordering::Relaxed) {
@@ -288,39 +388,60 @@ impl Animation {
                 Instant::now() < deadline,
                 "decoder produced no complete first frame within {timeout:?}"
             );
-            if let Err(error) = self.request_frame() {
-                return if self.close.load(Ordering::Relaxed) {
-                    Ok(None)
-                } else {
-                    Err(error)
-                };
-            }
-            match self.frames.recv_timeout(
+            match self.ready.recv_timeout(
                 FIRST_FRAME_POLL.min(deadline.saturating_duration_since(Instant::now())),
             ) {
-                Ok(image) => {
-                    self.in_flight = false;
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    let ready = self
+                        .preparation
+                        .take()
+                        .context("animation source worker is missing")?
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("animation source worker panicked"))??;
+                    let source = match ready {
+                        Ready::Cancelled => return Ok(None),
+                        Ready::Content(source) => source,
+                        Ready::Video { latest, decoder } => {
+                            self.decoder = Some(decoder);
+                            wait_for_first_video_frame(&latest, &self.close, deadline, timeout)?;
+                            Source::Video { latest }
+                        }
+                    };
                     if self.close.load(Ordering::Relaxed) {
                         return Ok(None);
                     }
                     ensure!(
                         Instant::now() < deadline,
-                        "decoder exceeded the first-frame timeout of {timeout:?}"
+                        "decoder produced no complete first frame within {timeout:?}"
                     );
-                    if image.is_some() {
-                        return Ok(image);
-                    }
-                    thread::sleep(FIRST_FRAME_POLL);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    if self.close.load(Ordering::Relaxed) {
-                        return Ok(None);
-                    }
-                    bail!("animation worker failed before its first complete frame")
+                    return Ok(Some(source));
                 }
             }
         }
+    }
+
+    fn add_callback(&self, ctx: &egui::Context) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let gpu = self.gpu.clone();
+        let gpu_error = self.gpu_error.clone();
+        let fit = self.fit;
+        ctx.layer_painter(egui::LayerId::background())
+            .add(egui::PaintCallback {
+                rect: ctx.screen_rect(),
+                callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+                    let gl = painter.gl();
+                    if let Err(error) = draw_content(gl, &gpu, &source, fit, info) {
+                        if let Ok(mut slot) = gpu_error.lock() {
+                            if slot.is_none() {
+                                *slot = Some(format!("{error:#}"));
+                            }
+                        }
+                    }
+                })),
+            });
     }
 
     fn show(&mut self, ctx: &egui::Context) -> Result<()> {
@@ -328,46 +449,31 @@ impl Animation {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return Ok(());
         }
-        let now = Instant::now();
-        if now >= self.next_frame || self.first.is_some() {
-            let image = if let Some(first) = self.first.take() {
-                Some(first)
-            } else if self.in_flight {
-                match self.frames.try_recv() {
-                    Ok(image) => {
-                        self.in_flight = false;
-                        image
-                    }
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => bail!("animation frame worker disconnected"),
-                }
-            } else {
-                None
-            };
-            if let Some(image) = image {
-                let limit = ctx.input(|input| input.max_texture_side);
-                ensure!(
-                    image.width() <= limit && image.height() <= limit,
-                    "frame exceeds the renderer's {limit}-pixel texture limit"
-                );
-                if let Some(texture) = &mut self.texture {
-                    texture.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.texture =
-                        Some(ctx.load_texture("animation", image, egui::TextureOptions::LINEAR));
-                }
+        if let Some(error) = self
+            .gpu_error
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU state was poisoned"))?
+            .take()
+        {
+            bail!("{error}");
+        }
+        if let Some(Source::Video { latest }) = self.source.as_deref() {
+            if let Some(error) = latest
+                .lock()
+                .map_err(|_| anyhow::anyhow!("video frame state was poisoned"))?
+                .error
+                .take()
+            {
+                bail!("{error}");
             }
-            self.request_frame()?;
-            self.next_frame = Instant::now() + self.interval;
         }
-        if let Some(texture) = &self.texture {
-            ctx.layer_painter(egui::LayerId::background()).image(
-                texture.id(),
-                ctx.screen_rect(),
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        let now = Instant::now();
+        if now >= self.next_frame {
+            self.next_frame = now
+                .checked_add(self.interval)
+                .context("frame clock overflow")?;
         }
+        self.add_callback(ctx);
         let delay = self
             .next_frame
             .saturating_duration_since(Instant::now())
@@ -378,10 +484,9 @@ impl Animation {
         ctx.request_repaint_after(delay.saturating_add(prediction));
         Ok(())
     }
-}
 
-impl eframe::App for Animation {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// One eframe tick: paint, or record the failure and close the window.
+    fn tick(&mut self, ctx: &egui::Context) {
         if let Err(error) = self.show(ctx) {
             if !self.close.load(Ordering::Relaxed) {
                 *self.outcome.borrow_mut() = Err(error);
@@ -389,17 +494,142 @@ impl eframe::App for Animation {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
+
+/// Latest decoded frame shared with the paint callback, plus the worker handle
+/// teardown joins.
+type Decoder = (Arc<Mutex<LatestVideo>>, JoinHandle<Result<()>>);
+
+fn start_video_decoder(
+    media: project::Media,
+    width: u32,
+    height: u32,
+    options: PlaybackOptions,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Decoder> {
+    let latest = Arc::new(Mutex::new(LatestVideo::default()));
+    let state = latest.clone();
+    let decoder = thread::Builder::new()
+        .name("animation-frames".into())
+        .spawn(move || {
+            let mut worker = match MediaWorker::start_yuv(&media, width, height, &options) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    publish_decoder_error(&state, &error);
+                    return Err(error);
+                }
+            };
+            let result = (|| {
+                while !cancelled.load(Ordering::Relaxed) {
+                    match worker.take_frame()? {
+                        Some(Frame::Yuv420(frame)) => {
+                            if let Ok(mut slot) = state.lock() {
+                                slot.frame = Some(frame);
+                            }
+                        }
+                        Some(Frame::Bgra(_)) => {
+                            bail!("YUV decoder returned BGRA pixels")
+                        }
+                        None => thread::sleep(VIDEO_POLL),
+                    }
+                }
+                Ok(())
+            })();
+            let cleanup = worker.shutdown();
+            if let Err(error) = &result {
+                publish_decoder_error(&state, error);
+            }
+            with_cleanup(result, cleanup)
+        })
+        .context("cannot start animation frame worker")?;
+    Ok((latest, decoder))
+}
+
+/// Publish the first decoder failure for the UI thread, which closes the
+/// window with it instead of silently freezing the last frame.
+fn publish_decoder_error(state: &Arc<Mutex<LatestVideo>>, error: &anyhow::Error) {
+    if let Ok(mut slot) = state.lock() {
+        if slot.error.is_none() {
+            slot.error = Some(format!("{error:#}"));
+        }
+    }
+}
+
+/// Block until the decoder produced one complete frame, respecting cancellation.
+fn wait_for_first_video_frame(
+    latest: &Arc<Mutex<LatestVideo>>,
+    cancelled: &Arc<AtomicBool>,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<()> {
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "decoder produced no complete first frame within {timeout:?}"
+        );
+        let mut slot = latest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("video frame state was poisoned"))?;
+        if let Some(error) = slot.error.take() {
+            bail!("{error}");
+        }
+        if slot.frame.is_some() {
+            return Ok(());
+        }
+        drop(slot);
+        thread::sleep(FIRST_FRAME_POLL);
+    }
+}
+
+impl eframe::App for Animation {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick(ctx);
+    }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 1.0]
+    }
+
+    fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        if let Some(gl) = gl {
+            let mut gpu = self.gpu.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(scene) = gpu.scene.take() {
+                scene.destroy(gl);
+            }
+            if let Some(image) = gpu.image.take() {
+                image.destroy(gl);
+            }
+            if let Some(video) = gpu.video.take() {
+                video.destroy(gl);
+            }
+            if let Some(renderer) = gpu.renderer.take() {
+                renderer.destroy(gl);
+            }
+        }
     }
 }
 
 impl Drop for Animation {
     fn drop(&mut self) {
         self.close.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let cleanup = worker
+        if let Some(preparation) = self.preparation.take() {
+            let cleanup = preparation
+                .join()
+                .map_err(|_| anyhow::anyhow!("animation source worker panicked"))
+                .and_then(|result| result)
+                .map(|ready| {
+                    if let Ready::Video { decoder, .. } = ready {
+                        self.decoder = Some(decoder);
+                    }
+                });
+            let previous = self.outcome.replace(Ok(()));
+            *self.outcome.borrow_mut() = with_cleanup(previous, cleanup);
+        }
+        if let Some(decoder) = self.decoder.take() {
+            let cleanup = decoder
                 .join()
                 .map_err(|_| anyhow::anyhow!("animation frame worker panicked"))
                 .and_then(|result| result);
@@ -507,18 +737,6 @@ mod tests {
             .contains("absolute"));
     }
 
-    #[test]
-    fn actual_frame_conversion_preserves_pixels_and_rejects_partial_frames() {
-        let image = frame_image(&[3, 17, 241, 255, 89, 53, 1, 255], 2, 1).unwrap();
-        assert_eq!(image.size, [2, 1]);
-        assert_eq!(image.pixels[0], egui::Color32::from_rgb(241, 17, 3));
-        assert_eq!(image.pixels[1], egui::Color32::from_rgb(1, 53, 89));
-        for length in [0, 3, 4, 7, 9] {
-            assert!(frame_image(&vec![0; length], 2, 1).is_err());
-        }
-        assert!(frame_image(&[], u32::MAX, u32::MAX).is_err());
-    }
-
     fn image_app() -> (tempfile::TempDir, Animation, Rc<RefCell<Result<()>>>) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sample.png");
@@ -534,9 +752,11 @@ mod tests {
     }
 
     #[test]
-    fn real_image_worker_paints_edge_to_edge_and_keeps_texture_without_new_frames() {
+    fn image_source_paints_one_full_window_callback_and_keeps_scheduling() {
         let (_directory, mut app, outcome) = image_app();
-        app.first = app.first_frame(Duration::from_secs(5)).unwrap();
+        let source = app.first_frame(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(matches!(source, Source::Image(_)));
+        app.source = Some(Arc::new(source));
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -546,42 +766,24 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run(input, |ctx| app.show(ctx).unwrap());
-        let texture = app.texture.as_ref().unwrap().id();
-        assert!(output.textures_delta.set.iter().any(|(id, delta)| {
-            *id == texture
-                && match &delta.image {
-                    egui::ImageData::Color(image) => image
-                        .pixels
-                        .iter()
-                        .all(|pixel| *pixel == egui::Color32::from_rgb(241, 17, 3)),
-                    _ => false,
-                }
-        }));
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-        let mesh = primitives
+        let callback = primitives
             .iter()
             .find_map(|primitive| match &primitive.primitive {
-                egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture => Some(mesh),
+                egui::epaint::Primitive::Callback(callback) => Some(callback),
                 _ => None,
             })
-            .unwrap();
-        assert!(mesh.vertices.iter().any(|v| v.pos == egui::pos2(0.0, 0.0)));
-        assert!(mesh
-            .vertices
-            .iter()
-            .any(|v| v.pos == egui::pos2(400.0, 200.0)));
-        // The real image worker has no second frame. Polling must retain the first texture.
+            .expect("the GPU draw must be one paint callback");
+        assert_eq!(
+            callback.rect,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))
+        );
+        // The image source has no second frame. Polling must keep scheduling.
         thread::sleep(app.interval);
         for _ in 0..5 {
             let _ = ctx.run(Default::default(), |ctx| app.show(ctx).unwrap());
         }
         let output = ctx.run(Default::default(), |ctx| app.show(ctx).unwrap());
-        assert_eq!(app.texture.as_ref().unwrap().id(), texture);
-        assert!(!output
-            .textures_delta
-            .set
-            .iter()
-            .any(|(id, _)| *id == texture));
         assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::ZERO);
         app.close.store(true, Ordering::Relaxed);
         let output = ctx.run(Default::default(), |ctx| app.show(ctx).unwrap());
@@ -590,6 +792,25 @@ mod tests {
             .contains(&egui::ViewportCommand::Close));
         drop(app);
         outcome.replace(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn gpu_failures_close_the_window_with_their_diagnostic() {
+        let (_directory, mut app, outcome) = image_app();
+        let source = app.first_frame(Duration::from_secs(5)).unwrap().unwrap();
+        app.source = Some(Arc::new(source));
+        *app.gpu_error.lock().unwrap() = Some("scene draw failed: test".into());
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| app.tick(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close));
+        drop(app);
+        assert!(outcome
+            .replace(Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("scene draw failed: test"));
     }
 
     #[test]
@@ -605,7 +826,8 @@ mod tests {
     #[test]
     fn fps_deadlines_remain_delayed_even_at_sixty_fps() {
         let (_directory, mut app, outcome) = image_app();
-        app.first = app.first_frame(Duration::from_secs(5)).unwrap();
+        let source = app.first_frame(Duration::from_secs(5)).unwrap().unwrap();
+        app.source = Some(Arc::new(source));
         let ctx = egui::Context::default();
         for fps in [1, 30, 60] {
             app.interval = Duration::from_secs_f64(1.0 / f64::from(fps));
@@ -628,15 +850,56 @@ mod tests {
     #[test]
     fn startup_failure_survives_worker_join() {
         let outcome = Rc::new(RefCell::new(Ok(())));
-        let mut app =
+        let app =
             Animation::start(args(), Arc::new(AtomicBool::new(false)), outcome.clone()).unwrap();
-        assert!(app.first_frame(Duration::from_secs(5)).is_err());
+        app.ready.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(app);
         assert!(outcome
             .replace(Ok(()))
             .unwrap_err()
             .to_string()
             .contains("regular media file"));
+    }
+
+    #[test]
+    fn source_preparation_error_is_returned_once() {
+        let outcome = Rc::new(RefCell::new(Ok(())));
+        let mut app =
+            Animation::start(args(), Arc::new(AtomicBool::new(false)), outcome.clone()).unwrap();
+        let error = match app.first_frame(Duration::from_secs(5)) {
+            Ok(_) => panic!("a missing source must fail startup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("regular media file"));
+        drop(app);
+        outcome.replace(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn missing_decoder_fails_video_startup_before_window_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.mp4");
+        std::fs::write(&path, b"not a real video").unwrap();
+        let mut args = args();
+        args.source = path;
+        args.ffmpeg = "missing-ffmpeg-binary".into();
+        let outcome = Rc::new(RefCell::new(Ok(())));
+        let mut app =
+            Animation::start(args, Arc::new(AtomicBool::new(false)), outcome.clone()).unwrap();
+        let error = match app.first_frame(Duration::from_secs(5)) {
+            Ok(_) => panic!("a missing decoder must fail first-frame startup"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("missing-ffmpeg-binary"),
+            "{error:#}"
+        );
+        drop(app);
+        assert!(outcome
+            .replace(Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("missing-ffmpeg-binary"));
     }
 
     #[test]

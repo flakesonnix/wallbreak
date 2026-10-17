@@ -1,5 +1,5 @@
 {
-  description = "Experimental Rust image/video and one-scene wallpaper player for Wayland";
+  description = "Experimental Rust image/video and layered-scene wallpaper player for Wayland";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/e11136d15d537efb924780f4bacbabd3340aac28";
 
   outputs = { nixpkgs, ... }:
@@ -28,6 +28,9 @@
         checkPhase = ''
           runHook preCheck
           export WALLPAPER_TEST_FFMPEG=${pkgs.lib.getExe pkgs.ffmpeg}
+          export WALLBREAK_TEST_EGL=${pkgs.libglvnd}/lib/libEGL.so.1
+          export __EGL_VENDOR_LIBRARY_FILENAMES=${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json
+          export LIBGL_ALWAYS_SOFTWARE=1
           export WALLBREAK_TEST_GSETTINGS=${pkgs.glib.bin}/bin/gsettings
           export WALLBREAK_TEST_DBUS_DAEMON=${pkgs.dbus}/bin/dbus-daemon
           export GSETTINGS_SCHEMA_DIR=${schemaRoot}/glib-2.0/schemas
@@ -80,7 +83,7 @@
             --prefix LD_LIBRARY_PATH : ${guiLibraries}
         '';
         meta = {
-          description = "Experimental Wayland image/video wallpaper player with one supported animated scene";
+          description = "Experimental Wayland image/video and layered-scene wallpaper player";
           license = pkgs.lib.licenses.mit;
           platforms = [ system ];
           mainProgram = "wallbreak";
@@ -110,6 +113,7 @@
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [ cargo rustc rustfmt clippy ffmpeg sway grim glib.bin dbus nodejs_24 zip ];
         shellHook = ''
+          export WALLBREAK_TEST_EGL=${pkgs.libglvnd}/lib/libEGL.so.1
           export XDG_DATA_DIRS=${schemaRoot}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}
           export GIO_EXTRA_MODULES=${pkgs.lib.getLib pkgs.dconf}/lib/gio/modules''${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}
           export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [

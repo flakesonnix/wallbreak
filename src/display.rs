@@ -426,6 +426,7 @@ impl Wallpaper {
         if now >= self.next_poll && (self.video || !self.received_frame) {
             if let Some(worker) = self.worker.as_mut() {
                 if let Some(frame) = worker.take_frame().context("wallpaper decoding failed")? {
+                    let frame = frame.into_bgra()?;
                     ensure!(
                         frame.len() == size.bytes,
                         "media decoder returned {} bytes; the {}x{} wallpaper requires {}",

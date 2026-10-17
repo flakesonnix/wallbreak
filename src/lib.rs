@@ -3,6 +3,8 @@ pub mod catalog;
 pub mod display;
 pub mod gnome;
 pub mod gnome_bridge;
+#[cfg(feature = "gui")]
+mod gpu;
 pub mod gui;
 #[cfg(feature = "gui")]
 pub mod library;

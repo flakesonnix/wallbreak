@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["flakesonnix"]
-description = "Experimental image/video and one-scene wallpaper player for Wayland layer-shell compositors"
+description = "Experimental image/video and layered-scene wallpaper player for Wayland"
 homepage = "https://github.com/flakesonnix/wallbreak"
 repository = "https://github.com/flakesonnix/wallbreak"
 license = "MIT"
@@ -14,6 +14,7 @@ default-run = "wallbreak"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+glow = { version = "0.13", optional = true }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 lz4_flex = "0.11"
 texture2ddecoder = "0.1"
@@ -32,7 +33,7 @@ eframe = { version = "0.28", default-features = false, features = [
 ], optional = true }
 
 [features]
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "dep:glow"]
 
 [[bin]]
 name = "wallbreak-gui"
@@ -45,4 +46,5 @@ path = "src/bin/wallbreak-renderer.rs"
 required-features = ["gui"]
 
 [dev-dependencies]
+khronos-egl = { version = "6", features = ["dynamic"] }
 tempfile = "3.20"

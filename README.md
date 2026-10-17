@@ -1,19 +1,21 @@
 # wallbreak
 
-An independent, experimental Rust image/video and one-scene wallpaper player
+An independent, experimental Rust image/video and layered-scene wallpaper player
 for Linux Wayland compositors implementing `wlr-layer-shell`, tested with Sway.
 GNOME has a static-image backend using `gsettings` and an optional GNOME 50
-Shell bridge for videos and the supported animated scene. The bridge must be
+Shell bridge for videos and supported animated scenes. The bridge must be
 installed and enabled separately; wallbreak never substitutes a foreground
 window when it is unavailable.
 It is not a full Wallpaper Engine clone. No Steam,
 Wine, or Wallpaper Engine executable is launched.
 
-Rust owns project selection, image decoding, bounded frame delivery, shared-memory
-presentation, output selection, and decoder cleanup. Videos use an external
-FFmpeg process, not a Rust video codec implementation. The supported animated
-scene uses an independent CPU renderer and native project textures. The Nix
-package supplies FFmpeg without changing the system configuration.
+Rust owns project selection, image decoding, bounded frame delivery, rendering,
+presentation, output selection, and decoder cleanup. Videos use
+an external FFmpeg process for CPU decoding, not a Rust video codec implementation
+or hardware decoding. Supported scenes use native project textures and independent
+CPU/GPU renderers; the active path depends on the backend (see
+[Rendering Backends](#rendering-backends)). The Nix package supplies FFmpeg without
+changing the system configuration.
 
 ## Quick start
 
@@ -96,9 +98,10 @@ Expect `State: ACTIVE` and protocol `1`. An `ERROR` state requires checking the
 extension error, not repeatedly enabling it. A loaded error-state module cannot
 be refreshed by simply toggling enable/disable in the same Shell session.
 
-Select the original Eagle Flag project (without `--preview`) and use Play, or
-run `play /absolute/path/to/eagleflag --duration-seconds 10`. The bridge owns a
-dedicated renderer and displays its cloned actor below application windows.
+Select a supported scene project (without `--preview`) and use Play, for example
+`play /absolute/path/to/eagleflag --duration-seconds 10`. Videos also use this
+bridge. It owns a dedicated renderer and displays its cloned actor below
+application windows.
 Pressing Super keeps the animation visible behind the overview controls and in
 the large workspace cards for the selected monitor. Small window thumbnails
 retain GNOME's native layout. The extension does not animate the lock/login
@@ -122,8 +125,9 @@ Image formats: JPEG, PNG, WebP, BMP, GIF. Only a single static frame is decoded;
 animated images and EXIF rotation are not implemented. Video input suffixes:
 MP4/M4V, MKV, WebM, MOV, AVI, OGV, WMV, MPG/MPEG. FFmpeg still has to validate
 their actual contents and codecs. Videos loop without audio. Presentation uses
-software-decoded XRGB shared memory, not GPU decoding; non-square-pixel video
-aspect correction is not implemented.
+CPU-decoded frames: XRGB shared memory on layer-shell, or I420/YUV texture uploads
+and GPU color conversion in the GNOME renderer. Neither path implements hardware
+video decoding; non-square-pixel video aspect correction is not implemented.
 
 Diagnostics go to stderr only when requested: the CLI's global `-v`/`-vv`/`-vvv`
 (or `WALLBREAK_LOG=error|warn|info|debug|trace` for every binary, including the
@@ -138,12 +142,43 @@ cargo build --locked --release
 ./target/release/wallbreak play /absolute/path/to/video.mp4 --ffmpeg /absolute/path/to/ffmpeg
 ```
 
+That default build is CLI-only. Add `--features gui` to build the control panel
+and `wallbreak-renderer`; the GNOME Shell bridge still requires separate
+installation and activation.
+
+## Rendering Backends
+
+| Path | Current implementation |
+| --- | --- |
+| GNOME bridge renderer | `src/renderer.rs` uses `glow` paint callbacks and `src/gpu.rs` to draw supported scenes, decoded images, and uploaded I420/YUV video planes. Video YUV-to-RGB conversion runs in a shader. |
+| GNOME static images | Public image and `--preview` playback uses `gsettings`, not the bridge renderer's image draw path. |
+| Sway / `wlr-layer-shell` | `src/display.rs` presents CPU-rendered/decoded frames through `wl_shm` XRGB buffers. It does not use the GPU renderer. |
+| CLI `check` / GUI previews | `MediaWorker` produces CPU frames. The GUI displays a finished preview as an egui texture, not through the scene/YUV GPU callbacks. |
+
+The GPU renderer requires OpenGL 3.1+ or OpenGL ES 3.0+ in the bridge-owned
+eframe window. Normal window exit deletes its owned GL resources through
+`on_exit`. This is not a standalone layer-shell EGL presenter: that backend is
+not implemented, and no `--software` flag exists. A GL context may itself use a
+software driver; using `glow` does not establish hardware acceleration or a
+performance improvement.
+
+Scene textures and still images are decoded on the CPU before upload. FFmpeg
+still performs video decoding, frame-rate filtering, cropping/scaling, and padding
+on the CPU before delivering I420 planes. Its scale filter explicitly normalizes
+GPU video output with `out_color_matrix=bt709:out_range=tv`, matching the shader's
+BT.709 limited-range conversion. This handles matrix/range conversion for
+correctly tagged BT.601/BT.709 full/limited-range inputs, not general color
+management: untagged or incorrect metadata, HDR transfer functions/color primaries,
+and chroma positioning remain limitations. The CPU and GPU scene renderers share
+validated scene/material data, not a guarantee of exact pixel parity or full
+Wallpaper Engine compatibility.
+
 ## Wallpaper Engine Projects
 
 `projects` lists every Wallpaper Engine project in your local Steam libraries
 with its support status, so you can pick one instead of typing paths.
 `inspect`, `check`, and `play` accept a project directory or `project.json` with
-an explicit `type: "video"` or one supported `type: "scene"` profile, plus a
+an explicit `type: "video"` or a supported `type: "scene"` profile, plus a
 project-relative `file`. The selected media must resolve inside that project,
 including through symlinks. Unknown types, malformed JSON, parent traversal, and
 missing media fail rather than silently choosing another file or preview.
@@ -239,19 +274,27 @@ included here. Local ownership does not establish redistribution rights.
 cargo test --locked
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --features gui --all-targets -- -D warnings
 cargo test --locked --features gui
 nix flake check .
 ```
 
-The default Cargo test run explicitly ignores tests requiring external programs.
-The Nix package runs the real FFmpeg decoding/loop/cleanup test as well as the
-ordinary unit and public CLI tests. For the explicit real-provider lanes:
+The default Cargo test runs ignore tests requiring external programs or an
+explicitly selected EGL library. The Nix package check is configured to include
+the real FFmpeg decoding/color/loop/cleanup tests and both ignored EGL tests via
+`--features gui --lib -- --include-ignored`, alongside ordinary unit and public
+CLI tests. Its EGL lane selects the explicit Mesa vendor library and forces
+software rendering. For the explicit real-provider lanes:
 
 ```bash
 nix develop .
 export WALLPAPER_TEST_FFMPEG="$(command -v ffmpeg)"
 export WALLPAPER_TEST_SCENE_ROOT=/absolute/path/to/eagleflag
 cargo test --locked --lib --bins --test cli --test scene -- --include-ignored
+
+# Real offscreen EGL without a compositor or desktop:
+# nix develop exports WALLBREAK_TEST_EGL as an absolute libEGL.so path.
+LIBGL_ALWAYS_SOFTWARE=1 cargo test --locked --features gui --lib gpu::tests::real_surfaceless -- --ignored --nocapture
 
 export WALLPAPER_TEST_SWAY="$(command -v sway)"
 export WALLPAPER_TEST_SWAYMSG="$(command -v swaymsg)"
@@ -262,6 +305,34 @@ cargo test --locked --test headless -- --ignored --nocapture
 export WALLBREAK_TEST_GSETTINGS="$(command -v gsettings)"
 cargo test --locked --features gui --test gnome -- --ignored
 ```
+
+The dev shell supplies the EGL loader but leaves driver selection to the host,
+unlike the package check's explicit Mesa vendor selection. Outside that shell,
+set `WALLBREAK_TEST_EGL` to an absolute EGL 1.5 library path with Mesa surfaceless
+support; without it the ignored GPU tests skip rather than verify rendering.
+
+The two `gpu::tests::real_surfaceless_*` tests create real desktop GL and GLES
+contexts, compile/link all production shaders, and read back rendered pixels.
+They cover image cover/contain and alpha compositing; a padded generic scene
+texture with opaque/translucent/additive blending; and I420 uploads at 6x4 and
+3x3, unpack alignment/state, resizing, invalid inputs, GL failures, and recovery.
+`flag`, `flowimage` (including layered flow), and `swayimage` shaders are compiled,
+but do not yet have golden-frame or CPU/GPU pixel-parity coverage.
+
+The real FFmpeg color test compares a CPU equivalent of the video shader's YUV
+conversion with BGRA output and known color patches for tagged BT.601/BT.709
+full/limited-range inputs, in both fit modes. Targeted EGL checks passed on Mesa
+llvmpipe exposing desktop OpenGL 4.6 and OpenGL ES 3.2; the real FFmpeg lane also
+passed via `nix develop`. The complete Nix package build/check and `nix flake
+check .` also passed, including software EGL, real FFmpeg, isolated gsettings,
+and simulated Shell lifecycle checks. These results do not establish
+hardware-driver behavior, live GNOME appearance, or exact scene parity. Tests
+requiring local commercial scene assets or an isolated Sway compositor were not
+executed in this verification run.
+
+The local scene and headless Sway checks exercise the CPU/SHM path, not the GNOME
+GPU renderer. Geometry and paint-callback lifecycle tests alone do not establish
+GPU/CPU pixel parity or live GNOME appearance; remaining checks are TODOs below.
 
 The local scene tests require an explicitly selected Eagle Flag project and do
 not bundle its textures. They check native texture decoding, profile resolution,
@@ -275,17 +346,42 @@ commercial fixture is required. X11, custom scene shaders (for example
 `cloudsbg`, `retro`, and `spritesheet` variants), JavaScript scenes, interactive
 wallpapers, and full Wallpaper Engine compatibility remain unsupported.
 
-Frames are admitted before allocation, with a 64 MiB physical-frame ceiling,
-at most three shared-memory presentation buffers, one pending presentation
-frame, and a latest-frame-only decoder slot. The reader can hold one additional
-frame while decoding. Image decoding has an independent 64 MiB allocation
-budget. Native scene textures have a separate 64 MiB decoded budget. The scene
-renderer may use up to eight threads; high-resolution scenes can therefore use
-substantial sustained CPU. FFmpeg has a 64 MiB per-allocation limit and two
-decoder threads, not a process-wide memory cap. It may access local files but
-network protocols are disabled. This is not a sandbox for untrusted media;
-decoder internals, total CPU/memory usage, and 4K/60-fps performance are not
-bounded or benchmarked here.
+Frames are admitted before allocation, with a 64 MiB physical-frame ceiling.
+The CPU/SHM path has at most three shared-memory presentation buffers, one pending
+presentation frame, and a latest-frame-only decoder slot. The reader can hold one
+additional frame while decoding. Direct-image decoding has separate 64 MiB
+decoder-allocation and RGBA-output limits. Native `.tex` files have a 64 MiB
+encoded-file limit and a 64 MiB sum-of-declared-RGBA-mip-expansions limit. Scene
+loading separately checks a 128 MiB aggregate decoded-RGBA budget; raw scene-image
+decoding can allocate before its RGBA size check. These checks are not a cap on
+transient allocations or copies. The scene CPU renderer may use up to eight
+threads; high-resolution scenes can therefore use substantial sustained CPU. GPU
+textures, mipmaps, driver allocations, and GNOME clone surfaces add memory beyond
+these CPU budgets; they are not a VRAM or total-process memory cap. FFmpeg has a
+64 MiB per-allocation limit and two decoder threads, not a process-wide memory
+cap. It may access local files but network protocols are disabled. This is not a
+sandbox for untrusted media; decoder internals, total CPU/memory usage, and
+4K/60-fps performance are not bounded or benchmarked here.
+
+## TODO
+
+- [ ] Add an EGL GPU presenter for `wlr-layer-shell` with automatic CPU/SHM
+  fallback and an explicit `--software` override.
+- [ ] Check real GNOME 50 playback after a Shell reload: scene/video appearance,
+  fit/scaling, monitor selection, desktop/overview clipping, and Stop cleanup.
+- [ ] Add fixed-time CPU/GPU scene comparisons for `flag`, flow, and sway, then
+  extend parity coverage across material constants, transforms, blending, and
+  fit modes. Shader compilation and generic-scene readback do not establish full
+  scene parity.
+- [ ] Define and test behavior for untagged/incorrect video color metadata, HDR
+  transfer functions/color primaries, and chroma positioning; matrix/range
+  normalization alone is not full color management.
+- [ ] Check RGBA expansion before decoding raw/packed scene images and reduce
+  transient texture copies during scene loading.
+- [ ] Measure equivalent CPU/GPU scene and video workloads: CPU time, CPU/GPU
+  frame time, and peak process-family/GPU memory, including FFmpeg and GNOME clones.
+  Record resolution, FPS, driver, and cold/warm runs before making performance
+  claims; no comparative measurements are available here.
 
 ## Releases
 
@@ -297,9 +393,11 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-You can build the same tarball locally with `scripts/package-release.sh`. The
-tarball does not bundle FFmpeg or the GUI's OpenGL/Wayland runtime libraries;
-prefer the Nix flake for a complete installation.
+You can build the same tarball locally with `scripts/package-release.sh`. It
+contains `wallbreak` and `wallbreak-gui`, but currently omits `wallbreak-renderer`
+and the extension archive required for GNOME animation. It also does not bundle
+FFmpeg or the GUI's OpenGL/Wayland runtime libraries; prefer the Nix flake for a
+complete installation.
 
 ## License
 
