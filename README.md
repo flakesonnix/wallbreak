@@ -109,6 +109,9 @@ screen or alter other monitors' backgrounds.
 Stop removes that session; it does not replace the GNOME background settings.
 The renderer paces its own frames without VSync, so hidden-source presentation
 cannot add a VSync wait to graceful shutdown.
+The desktop clone stays attached and privacy-gated during overview transitions;
+GNOME's native parent groups control the crossfade instead of the bridge hiding
+the desktop animation as soon as the overview starts opening.
 
 After updating the extension files, previously loaded Shell modules remain
 cached until the next login; toggling enable/disable does not reload their code.

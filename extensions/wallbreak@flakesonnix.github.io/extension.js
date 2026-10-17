@@ -334,8 +334,10 @@ export default class WallbreakExtension extends Extension {
         const allowed = this._live(session) && Main.sessionMode.hasWindows &&
             !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter &&
             !Main.layoutManager.screenShieldGroup.visible;
+        // Native parent groups own the overview crossfade. Hiding this clone at
+        // `showing` exposes the static wallpaper before that transition finishes.
         if (session.clone)
-            session.clone.visible = allowed && !session.overview;
+            session.clone.visible = allowed;
         session.overviewClones?.setVisibility(allowed, session.overview);
     }
 

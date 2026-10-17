@@ -491,6 +491,40 @@ test('Start validates file, connector and geometry before spawning; never replac
     assert.deepEqual(h.process().sent, []);
 });
 
+test('overview transitions never hide or replace the desktop clone before its native parent', async () => {
+    const h = await harness();
+    const token = h.start();
+    const window = h.window(token);
+    window.shown();
+    const background = h.manager.backgroundActor;
+    const desktopGroup = new Actor();
+    desktopGroup.add_child(background);
+    const clone = background.children[0];
+    const owner = h.overviewOwners[0];
+    // Include reversal mid-transition, not just the settled overview states.
+    for (const signal of ['showing', 'shown', 'hiding', 'showing', 'hiding', 'hidden']) {
+        desktopGroup.visible = true;
+        h.overview.emit(signal);
+        assert.equal(clone.visible, true, `desktop still contributes during ${signal}`);
+        assert.equal(background.children[0], clone);
+        assert.equal(clone.source, window.actor);
+        assert.equal(owner.allowed, true);
+        assert.equal(owner.overviewVisible, signal !== 'hidden');
+        assert.equal(desktopGroup.visible, true, 'only native Shell code hides the parent');
+        desktopGroup.visible = false;
+        h.sessionMode.emit('updated');
+        assert.equal(clone.visible, true, 'retain the clone under its hidden native parent');
+        assert.equal(desktopGroup.visible, false);
+        assert.equal(window.actor.opacity, 0);
+        assert.equal(window.inhibitors, 1);
+    }
+    h.call('Stop', [token]);
+    h.process().exit();
+    await flush();
+    assert.equal(clone.destroyed, true);
+    assert.equal(h.status(token).value[0], 'stopped');
+});
+
 test('delayed metadata, clone reattachment and overview visibility keep the same privacy gate', async () => {
     const h = await harness();
     const token = h.start();
@@ -521,7 +555,7 @@ test('delayed metadata, clone reattachment and overview visibility keep the same
     assert.equal(overview.allowed, true);
     assert.equal(overview.overviewVisible, false);
     h.overview.emit('showing');
-    assert.equal(clone.visible, false);
+    assert.equal(clone.visible, true);
     assert.equal(overview.allowed, true);
     assert.equal(overview.overviewVisible, true);
     h.overview.emit('hidden');
@@ -572,7 +606,8 @@ test('playback started in overview shows there without changing desktop focus or
     const window = h.window(token);
     window.shown();
     assert.equal(h.status(token).value[0], 'running');
-    assert.equal(h.manager.backgroundActor.children[0].visible, false);
+    const clone = h.manager.backgroundActor.children[0];
+    assert.equal(clone.visible, true, 'native desktop ancestry controls overview occlusion');
     const owner = h.overviewOwners[0];
     assert.equal(owner.allowed, true);
     assert.equal(owner.overviewVisible, true);
@@ -581,11 +616,16 @@ test('playback started in overview shows there without changing desktop focus or
         h.sessionMode[field] = value;
         h.sessionMode.emit('updated');
         assert.equal(owner.allowed, false, field);
+        assert.equal(clone.visible, false, field);
         h.sessionMode[field] = previous;
+        h.sessionMode.emit('updated');
+        assert.equal(owner.allowed, true, field);
+        assert.equal(clone.visible, true, field);
     }
     h.layoutManager.screenShieldGroup.visible = true;
     h.layoutManager.screenShieldGroup.emit('notify::visible');
     assert.equal(owner.allowed, false);
+    assert.equal(clone.visible, false);
     h.call('Stop', [token]);
     h.process().exit();
     await flush();
