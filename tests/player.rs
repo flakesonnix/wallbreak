@@ -288,11 +288,13 @@ fn narrow_panel_collapses_sidebar_into_central_column() {
     for width in [500.0f32, 1200.0] {
         let mut panel = Panel::new();
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(width, 700.0),
-        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 700.0),
+            )),
+            ..Default::default()
+        };
         let output = ctx.run(input, |ctx| panel.show(ctx));
         let text = output
             .shapes

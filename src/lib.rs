@@ -1,7 +1,11 @@
+#[cfg(feature = "gui")]
+pub mod catalog;
 pub mod display;
 pub mod gnome;
 pub mod gnome_bridge;
 pub mod gui;
+#[cfg(feature = "gui")]
+pub mod library;
 pub mod media;
 pub mod project;
 #[cfg(feature = "gui")]

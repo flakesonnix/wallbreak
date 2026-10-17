@@ -25,6 +25,9 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |_cc| {
             let mut panel = Panel::new();
+            if !smoke {
+                panel.load_settings();
+            }
             panel.refresh();
             Ok(Box::new(SmokePanel {
                 panel,
