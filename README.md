@@ -159,11 +159,20 @@ installation and activation.
 | CLI `check` / GUI previews | `MediaWorker` produces CPU frames. The GUI displays a finished preview as an egui texture, not through the scene/YUV GPU callbacks. |
 
 The GPU renderer requires OpenGL 3.1+ or OpenGL ES 3.0+ in the bridge-owned
-eframe window. Normal window exit deletes its owned GL resources through
-`on_exit`. This is not a standalone layer-shell EGL presenter: that backend is
-not implemented, and no `--software` flag exists. A GL context may itself use a
+eframe window. GPU scenes additionally require `GL_EXT_color_buffer_float` and
+`GL_EXT_float_blend` on GLES. A missing capability produces a scene-specific
+error rather than silently clamping intermediate colors; image/video rendering
+does not require the float target. Normal window exit deletes owned GL resources
+through `on_exit`. This is not a standalone layer-shell EGL presenter: that
+backend is not implemented, and no `--software` flag exists. A GL context may use a
 software driver; using `glow` does not establish hardware acceleration or a
 performance improvement.
+
+Scenes accumulate into a cached RGBA32F framebuffer, preserving the CPU path's
+floating-point RGB and alpha blend factors until one final opaque output pass.
+The CPU reference is unchanged. The target is allocated on first scene draw,
+reused at the same physical size, and recreated on size changes. The final pass
+restores the caller's draw framebuffer, viewport, clipping, and color mask.
 
 Scene textures and still images are decoded on the CPU before upload. FFmpeg
 still performs video decoding, frame-rate filtering, cropping/scaling, and padding
@@ -319,8 +328,23 @@ contexts, compile/link all production shaders, and read back rendered pixels.
 They cover image cover/contain and alpha compositing; a padded generic scene
 texture with opaque/translucent/additive blending; and I420 uploads at 6x4 and
 3x3, unpack alignment/state, resizing, invalid inputs, GL failures, and recovery.
-`flag`, `flowimage` (including layered flow), and `swayimage` shaders are compiled,
-but do not yet have golden-frame or CPU/GPU pixel-parity coverage.
+They also compare 720 fixed-time synthetic scene frames against the unchanged
+CPU renderer: 18 fixtures on both GL APIs, two output sizes, cover/contain, and
+five times per case. The fixtures load through the production scene parser and
+cover `flag`, both `flowimage` layouts, `swayimage`, and generic constants,
+including reverse animation, signed scroll, rotation, padded textures,
+opaque/translucent/additive stacks, brightness above one or below zero, alpha
+outside 0..1, zero powers, and negative bases with integer powers. Pixel tests
+retain every border pixel, require exact opaque alpha, and allow at most 4/255
+RGB error with a per-channel mean of at most 0.75/255 over content pixels. The
+observed maximum after the float-compositing fix was 3/255 on Mesa llvmpipe.
+
+The float-target regressions additionally check allocation reuse, resizing,
+output budgets, nonzero viewport origins, scissoring, distinct read/draw FBOs,
+caller-state restoration, resource deletion, and retry after a pending GL error.
+They do not inject genuine driver OOM. These are synthetic CPU/GPU comparisons,
+not golden frames from Wallpaper Engine or proof for arbitrary hardware and
+non-finite arithmetic.
 
 The real FFmpeg color test compares a CPU equivalent of the video shader's YUV
 conversion with BGRA output and known color patches for tagged BT.601/BT.709
@@ -365,7 +389,13 @@ best-effort; these checks are not a cap on transient allocations or copies in
 other workflows. The scene CPU renderer may use up to eight
 threads; high-resolution scenes can therefore use substantial sustained CPU. GPU
 textures, mipmaps, driver allocations, and GNOME clone surfaces add memory beyond
-these CPU budgets; they are not a VRAM or total-process memory cap. FFmpeg has a
+these CPU budgets. The scene accumulator uses 16 bytes per output pixel: about
+31.6 MiB at 1920x1080 or 126.6 MiB at 3840x2160, with at most 256 MiB of texel
+storage under the 64 MiB RGBA8 output admission limit. Old target objects are
+deleted before replacement. These figures are derived storage sizes, not
+measured VRAM/process peaks; drivers can retain additional or in-flight storage.
+The extra resolve pass and full playback frame-time costs have not been
+benchmarked. These limits are not a VRAM or total-process memory cap. FFmpeg has a
 64 MiB per-allocation limit and two decoder threads, not a process-wide memory
 cap. It may access local files but network protocols are disabled. This is not a
 sandbox for untrusted media; decoder internals, total CPU/memory usage, and
@@ -400,10 +430,11 @@ rendering-performance comparison or a 4K/60-fps claim.
   fallback and an explicit `--software` override.
 - [ ] Check real GNOME 50 playback after a Shell reload: scene/video appearance,
   fit/scaling, monitor selection, desktop/overview clipping, and Stop cleanup.
-- [ ] Add fixed-time CPU/GPU scene comparisons for `flag`, flow, and sway, then
-  extend parity coverage across material constants, transforms, blending, and
-  fit modes. Shader compilation and generic-scene readback do not establish full
-  scene parity.
+- [x] Add fixed-time synthetic CPU/GPU comparisons for flag, flow, sway, and
+  generic materials across representative constants, rotation, blending, and fit.
+- [ ] Extend parity checks to hardware drivers, exact raster-edge ties, and
+  non-finite/extreme arithmetic, including negative brightness with fractional
+  powers. The synthetic matrix does not establish bit-exact or full scene parity.
 - [ ] Define and test behavior for untagged/incorrect video color metadata, HDR
   transfer functions/color primaries, and chroma positioning; matrix/range
   normalization alone is not full color management.
@@ -412,7 +443,7 @@ rendering-performance comparison or a 4K/60-fps claim.
 - [ ] Measure equivalent CPU/GPU scene and video workloads: CPU time, CPU/GPU
   frame time, and peak process-family/GPU memory, including FFmpeg and GNOME clones.
   Record resolution, FPS, driver, and cold/warm runs before making performance
-  claims; no comparative measurements are available here.
+  claims; comparative rendering measurements are still unavailable.
 
 ## Releases
 

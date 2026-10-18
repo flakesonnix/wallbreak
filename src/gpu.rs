@@ -12,7 +12,7 @@ use glow::HasContext;
 use image::RgbaImage;
 
 use crate::{
-    media::{Fit, Yuv420Frame, yuv420_len},
+    media::{Fit, Yuv420Frame, frame_len, yuv420_len},
     scene::{Blending, LayerGeometry, MaterialRuntime, Scene, SceneLayout, scene_layout},
     texture::Texture,
 };
@@ -72,8 +72,16 @@ uniform float u_time;
 void main() {
     vec4 texel = texture(u_texture, v_uv + u_time * u_scroll);
     vec3 rgb = texel.rgb * u_brightness;
-    if (u_power != 1.0) {
-        rgb = pow(rgb, vec3(u_power));
+    if (u_power == 0.0) {
+        rgb = vec3(1.0);
+    } else if (u_power != 1.0) {
+        if (u_power == floor(u_power)) {
+            // GLSL pow() is undefined for negative bases, including integer powers.
+            vec3 magnitude = pow(abs(rgb), vec3(u_power));
+            rgb = mod(u_power, 2.0) == 0.0 ? magnitude : magnitude * sign(rgb);
+        } else {
+            rgb = pow(rgb, vec3(u_power));
+        }
     }
     frag_color = vec4(rgb, texel.a * u_alpha);
 }
@@ -421,6 +429,104 @@ fn bytes_of<T>(slice: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 
+/// Preserve the CPU compositor's f32 intermediates until the final byte conversion.
+struct SceneTarget {
+    framebuffer: glow::Framebuffer,
+    texture: glow::Texture,
+    width: u32,
+    height: u32,
+}
+
+impl SceneTarget {
+    fn new(gl: &glow::Context, width: u32, height: u32) -> Result<Self> {
+        // RGBA32F storage is four times the admitted RGBA8 output size.
+        frame_len(width, height).context("scene compositor output exceeds its frame budget")?;
+        if gl.version().is_embedded {
+            let extensions = gl.supported_extensions();
+            ensure!(
+                extensions.contains("GL_EXT_color_buffer_float")
+                    && extensions.contains("GL_EXT_float_blend"),
+                "GPU scene compositing requires GL_EXT_color_buffer_float and GL_EXT_float_blend on OpenGL ES"
+            );
+        }
+        let max_size = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) };
+        ensure!(
+            max_size > 0 && width <= max_size as u32 && height <= max_size as u32,
+            "scene compositor output exceeds GL_MAX_TEXTURE_SIZE ({max_size})"
+        );
+        let framebuffer = unsafe { gl.create_framebuffer() }.map_err(anyhow::Error::msg)?;
+        let texture = match unsafe { gl.create_texture() } {
+            Ok(texture) => texture,
+            Err(error) => {
+                unsafe { gl.delete_framebuffer(framebuffer) };
+                return Err(anyhow::Error::msg(error));
+            }
+        };
+        let target = Self {
+            framebuffer,
+            texture,
+            width,
+            height,
+        };
+        let previous = unsafe {
+            std::num::NonZeroU32::new(gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) as u32)
+                .map(glow::NativeFramebuffer)
+        };
+        let result = (|| -> Result<()> {
+            let _unpack = UnpackState::tight(gl, 0);
+            let status;
+            unsafe {
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::NEAREST as i32);
+                }
+                for parameter in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::CLAMP_TO_EDGE as i32);
+                }
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA32F as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::FLOAT,
+                    None,
+                );
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(framebuffer));
+                gl.framebuffer_texture_2d(
+                    glow::DRAW_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(texture),
+                    0,
+                );
+                status = gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER);
+            }
+            check_gl(gl).context("floating-point scene allocation was rejected by the driver")?;
+            ensure!(
+                status == glow::FRAMEBUFFER_COMPLETE,
+                "floating-point scene framebuffer is incomplete ({status:#x})"
+            );
+            Ok(())
+        })();
+        unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous) };
+        if let Err(error) = result {
+            target.destroy(gl);
+            return Err(error);
+        }
+        Ok(target)
+    }
+
+    fn destroy(&self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_framebuffer(self.framebuffer);
+            gl.delete_texture(self.texture);
+        }
+    }
+}
+
 /// GPU programs shared by every scene, image, and video draw.
 pub(crate) struct Renderer {
     quad: Quad,
@@ -431,6 +537,7 @@ pub(crate) struct Renderer {
     flow: Program,
     flow_layers: Program,
     sway: Program,
+    scene_target: Option<SceneTarget>,
 }
 
 impl Renderer {
@@ -538,6 +645,7 @@ impl Renderer {
                 flow,
                 flow_layers,
                 sway,
+                scene_target: None,
             }),
             Err(error) => {
                 for program in programs {
@@ -565,7 +673,7 @@ impl Renderer {
     /// `width` and `height` are the physical framebuffer pixels; the caller has
     /// already set the viewport to cover them.
     pub(crate) fn draw_scene(
-        &self,
+        &mut self,
         gl: &glow::Context,
         scene: &GpuScene,
         time: f32,
@@ -574,23 +682,84 @@ impl Renderer {
         fit: Fit,
     ) -> Result<()> {
         ensure!(time.is_finite() && time >= 0.0, "scene time must be finite");
-        ensure!(width > 0 && height > 0, "scene viewport must be nonzero");
+        frame_len(width, height)?;
         let layout = scene_layout(scene.projection, width, height, fit)?;
         let mut color_mask = [0; 4];
+        let mut viewport = [0; 4];
+        let framebuffer;
+        let scissor;
         unsafe {
             gl.get_parameter_i32_slice(glow::COLOR_WRITEMASK, &mut color_mask);
-            gl.color_mask(true, true, true, true);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::CULL_FACE);
-            gl.disable(glow::BLEND);
-            gl.clear_color(scene.clear[0], scene.clear[1], scene.clear[2], 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            // Scene compositing only changes RGB; the CPU path is always opaque.
-            gl.color_mask(true, true, true, false);
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            framebuffer = std::num::NonZeroU32::new(
+                gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) as u32,
+            )
+            .map(glow::NativeFramebuffer);
+            scissor = gl.is_enabled(glow::SCISSOR_TEST);
         }
-        for layer in &scene.layers {
-            let placement = layer_placement(&layout, &layer.geometry, width, height);
-            self.draw_layer(gl, &layer.material, placement, time, layer.blending);
+        let mut result = (|| -> Result<()> {
+            if self
+                .scene_target
+                .as_ref()
+                .is_none_or(|target| (target.width, target.height) != (width, height))
+            {
+                // Release old storage before growing, rather than retaining two float frames.
+                if let Some(target) = self.scene_target.take() {
+                    target.destroy(gl);
+                }
+                self.scene_target = Some(SceneTarget::new(gl, width, height)?);
+            }
+            let target = self.scene_target.as_ref().unwrap();
+            unsafe {
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target.framebuffer));
+                gl.viewport(0, 0, width as i32, height as i32);
+                gl.disable(glow::SCISSOR_TEST);
+                gl.color_mask(true, true, true, true);
+                gl.disable(glow::DEPTH_TEST);
+                gl.disable(glow::CULL_FACE);
+                gl.disable(glow::BLEND);
+                gl.clear_buffer_f32_slice(
+                    glow::COLOR,
+                    0,
+                    &[scene.clear[0], scene.clear[1], scene.clear[2], 1.0],
+                );
+                // RGB keeps unclamped f32 intermediates; the final scene remains opaque.
+                gl.color_mask(true, true, true, false);
+            }
+            for layer in &scene.layers {
+                let placement = layer_placement(&layout, &layer.geometry, width, height);
+                self.draw_layer(gl, &layer.material, placement, time, layer.blending);
+            }
+            Ok(())
+        })();
+        unsafe {
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, framebuffer);
+            gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            } else {
+                gl.disable(glow::SCISSOR_TEST);
+            }
+        }
+        if result.is_ok() {
+            unsafe {
+                gl.disable(glow::BLEND);
+                gl.color_mask(true, true, true, true);
+            }
+            self.image.bind(gl);
+            bind_texture(gl, 0, self.scene_target.as_ref().unwrap().texture);
+            self.image.set_texture(gl, "u_texture", 0);
+            // FBO textures are bottom-up, unlike decoded source images.
+            self.draw_quad(
+                gl,
+                &self.image,
+                Placement {
+                    origin: [-1.0, -1.0],
+                    axis_u: [2.0, 0.0],
+                    axis_v: [0.0, 2.0],
+                },
+            );
+            result = check_gl(gl).context("scene compositing failed");
         }
         unsafe {
             gl.color_mask(
@@ -600,7 +769,7 @@ impl Renderer {
                 color_mask[3] != 0,
             );
         }
-        Ok(())
+        result
     }
 
     fn draw_layer(
@@ -798,6 +967,9 @@ impl Renderer {
 
     /// Delete every GL object owned by this renderer.
     pub(crate) fn destroy(&self, gl: &glow::Context) {
+        if let Some(target) = &self.scene_target {
+            target.destroy(gl);
+        }
         self.quad.destroy(gl);
         for program in [
             &self.image,
@@ -1516,6 +1688,7 @@ impl Clock {
 mod tests {
     use super::*;
     use khronos_egl as egl;
+    use serde_json::json;
 
     // EGL displays may be shared between contexts, so do not terminate one in
     // parallel with another test using the same display.
@@ -1724,6 +1897,523 @@ mod tests {
         );
     }
 
+    type TexelPattern = fn(u32, u32) -> [u8; 4];
+
+    fn padded_scene_tex(pixel: TexelPattern) -> Vec<u8> {
+        // Logical 5x3 pixels occupy the upper left of a stored 7x5 RGBA mip.
+        let mut file = Vec::from(b"TEXV0005\0TEXI0001\0".as_slice());
+        for word in [0u32, 0, 7, 5, 5, 3, 0xff123456] {
+            file.extend_from_slice(&word.to_le_bytes());
+        }
+        file.extend_from_slice(b"TEXB0003\0");
+        for word in [1u32, u32::MAX, 1, 7, 5, 0, 140, 140] {
+            file.extend_from_slice(&word.to_le_bytes());
+        }
+        for y in 0..5 {
+            for x in 0..7 {
+                file.extend_from_slice(&if x < 5 && y < 3 {
+                    pixel(x, y)
+                } else {
+                    [255, 0, 255, 255]
+                });
+            }
+        }
+        file
+    }
+
+    fn real_scene_parity(gl: &glow::Context, renderer: &mut Renderer) -> Vec<String> {
+        use crate::scene::MaterialProfile;
+        use std::fs;
+
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["models", "materials", "shaders"] {
+            fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let properties = json!({
+            "schemecolor": {"type": "color", "value": "0.12 0.28 0.53"},
+            "flagcolor1": {"type": "color", "value": "0.61 0.19 0.08"},
+            "flagcolor2": {"type": "color", "value": "0.17 0.57 0.32"}
+        });
+        fs::write(
+            root.path().join("project.json"),
+            serde_json::to_vec(&json!({
+                "type": "scene", "file": "scene.json", "general": {"properties": properties}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let properties =
+            crate::scene::parse_project_colors(&serde_json::from_value(properties).unwrap())
+                .unwrap();
+        // Parser input, not GLSL compiled by the test: use this project's bias,
+        // not the usual 0.5 or a literal copied from a shipped wallpaper.
+        fs::write(
+            root.path().join("shaders/flowimage.frag"),
+            "// flowMask - vec2(0.5, 0.5) is only a comment.\n\
+             vec2 flow = (flowColors.rg - vec2(0.29, 0.61)) * 2.0;\n",
+        )
+        .unwrap();
+        let textures: [(&str, TexelPattern); 7] = [
+            ("zero", |x, y| {
+                [0, 0, 0, (75 + ((x + 2 * y) % 5) * 32) as u8]
+            }),
+            ("base", |x, y| {
+                [
+                    (40 + x * 30 + y * 9) as u8,
+                    (52 + y * 45 + (x % 2) * 24) as u8,
+                    (38 + ((2 * x + 3 * y) % 7) * 25) as u8,
+                    (75 + ((x + 2 * y) % 5) * 32) as u8,
+                ]
+            }),
+            ("layer1", |x, y| {
+                [
+                    (27 + x * 17 + y * 22) as u8,
+                    (154 - x * 19 + y * 12) as u8,
+                    (52 + ((3 * x + y) % 6) * 23) as u8,
+                    (90 + ((2 * x + y) % 5) * 28) as u8,
+                ]
+            }),
+            ("layer2", |x, y| {
+                [
+                    (162 - x * 23 + y * 8) as u8,
+                    (43 + ((x + 3 * y) % 6) * 24) as u8,
+                    (44 + x * 23 + y * 15) as u8,
+                    (105 + ((x + y) % 5) * 30) as u8,
+                ]
+            }),
+            ("mask", |x, y| {
+                [
+                    (52 + x * 34 + y * 6) as u8,
+                    (193 - y * 49 - x * 9) as u8,
+                    (36 + ((x + 2 * y) % 5) * 39) as u8,
+                    (63 + ((2 * x + y) % 5) * 31) as u8,
+                ]
+            }),
+            ("normal", |x, y| {
+                [
+                    (33 + x * 21 + y * 13) as u8,
+                    (84 + ((x + 2 * y) % 5) * 23) as u8,
+                    (70 + x * 15 + y * 18) as u8,
+                    (93 + ((2 * x + y) % 5) * 17) as u8,
+                ]
+            }),
+            ("cloth", |x, y| {
+                [
+                    (86 + ((2 * x + 3 * y) % 7) * 19) as u8,
+                    (31 + x * 27 + y * 11) as u8,
+                    (47 + y * 42 + x * 13) as u8,
+                    (81 + ((x + y) % 5) * 29) as u8,
+                ]
+            }),
+        ];
+        for (name, pixel) in textures {
+            fs::write(
+                root.path().join(format!("materials/{name}.tex")),
+                padded_scene_tex(pixel),
+            )
+            .unwrap();
+        }
+
+        let generic = |texture: &str, blending: &str, constants: serde_json::Value| {
+            json!({"shader": "genericimage", "textures": [texture],
+                "blending": blending, "constantshadervalues": constants})
+        };
+        let mut cases = Vec::new();
+        for (direction, sign, rotation) in [("forward", 1.0, 0.0), ("reverse", -1.0, 0.43)] {
+            for (name, pass) in [
+                (
+                    "flag",
+                    json!({"shader": "flag", "textures": ["base", "normal", "cloth"],
+                        "combos": {"TINT": 1},
+                        "usershadervalues": {"schemecolor": "color1", "flagcolor1": "color2", "flagcolor2": "color3"},
+                        "constantshadervalues": {"Speed": sign * 0.57, "Strength": 0.73}}),
+                ),
+                (
+                    "flowimage_2tex",
+                    json!({"shader": "flowimage", "textures": ["base", "mask"],
+                        "constantshadervalues": {"Bright": 0.83, "Speed": sign * 0.73, "Amount": 2.7}}),
+                ),
+                (
+                    "flowimage_4tex",
+                    json!({"shader": "flowimage", "textures": ["mask", "base", "layer1", "layer2"],
+                        "constantshadervalues": {"Bright": 0.91, "Amount": 3.1,
+                            "Speed0": sign * 0.73, "Speed1": sign * -0.41, "Speed2": sign * 1.17}}),
+                ),
+                (
+                    "swayimage",
+                    json!({"shader": "swayimage", "textures": ["base", "mask"],
+                        "constantshadervalues": {"Bright": 0.79, "Speed": sign * 0.37, "Amount": 2.3}}),
+                ),
+                (
+                    "generic_constants",
+                    generic(
+                        "base",
+                        "translucent",
+                        json!({"Bright": 0.87, "Alpha": 0.72,
+                            "Power": 1.65, "Scroll 1 X": sign * 0.31, "Scroll 1 Y": sign * -0.47}),
+                    ),
+                ),
+            ] {
+                cases.push((format!("{name}/{direction}"), vec![pass], rotation, true));
+            }
+        }
+        cases.push((
+            "blend_stack".into(),
+            vec![
+                generic(
+                    "base",
+                    "opaque",
+                    json!({"Bright": 0.61, "Power": 0.8,
+                        "Scroll 1 X": 0.29, "Scroll 1 Y": -0.43}),
+                ),
+                generic(
+                    "layer1",
+                    "translucent",
+                    json!({"Bright": 0.73, "Alpha": 0.64,
+                        "Power": 1.3, "Scroll 1 X": -0.37, "Scroll 1 Y": 0.21}),
+                ),
+                generic(
+                    "layer2",
+                    "additive",
+                    json!({"Bright": 0.42, "Alpha": 0.51,
+                        "Scroll 1 X": 0.23, "Scroll 1 Y": -0.33}),
+                ),
+            ],
+            -0.31,
+            true,
+        ));
+        cases.push((
+            "bright_translucent_stack".into(),
+            vec![
+                generic(
+                    "base",
+                    "translucent",
+                    json!({"Bright": 3.8, "Alpha": 0.9,
+                        "Scroll 1 X": 0.31, "Scroll 1 Y": -0.47}),
+                ),
+                generic(
+                    "layer2",
+                    "translucent",
+                    json!({"Bright": 0.28, "Alpha": 0.95,
+                        "Scroll 1 X": -0.37, "Scroll 1 Y": 0.21}),
+                ),
+            ],
+            0.43,
+            false,
+        ));
+        for (name, constants) in [
+            (
+                "generic_alpha_over_one",
+                json!({"Bright": 0.8, "Alpha": 3.1}),
+            ),
+            (
+                "generic_alpha_negative",
+                json!({"Bright": 0.8, "Alpha": -0.65}),
+            ),
+            (
+                "generic_bright_negative",
+                json!({"Bright": -0.4, "Alpha": 0.65, "Power": 1.0}),
+            ),
+            (
+                "generic_negative_squared",
+                json!({"Bright": -0.4, "Alpha": 0.65, "Power": 2.0}),
+            ),
+            (
+                "generic_negative_cubed",
+                json!({"Bright": -0.4, "Alpha": 0.65, "Power": 3.0}),
+            ),
+        ] {
+            let mut pass = generic("base", "translucent", constants);
+            pass["constantshadervalues"]["Scroll 1 X"] = json!(-0.31);
+            pass["constantshadervalues"]["Scroll 1 Y"] = json!(0.47);
+            cases.push((name.into(), vec![pass], 0.0, false));
+        }
+        cases.push((
+            "generic_zero_power".into(),
+            vec![generic(
+                "zero",
+                "translucent",
+                json!({"Power": 0.0, "Alpha": 0.65,
+                "Scroll 1 X": -0.31, "Scroll 1 Y": 0.47}),
+            )],
+            0.0,
+            false,
+        ));
+
+        let mut failures = Vec::new();
+        for (name, passes, rotation, ordinary) in cases {
+            let mut objects = Vec::new();
+            for (index, mut pass) in passes.into_iter().enumerate() {
+                pass["depthtest"] = json!("disabled");
+                pass["depthwrite"] = json!("disabled");
+                pass["cullmode"] = json!("nocull");
+                fs::write(
+                    root.path().join(format!("materials/{index}.json")),
+                    serde_json::to_vec(&json!({"passes": [pass]})).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    root.path().join(format!("models/{index}.json")),
+                    serde_json::to_vec(&json!({"width": 12, "height": 8,
+                        "material": format!("materials/{index}.json")}))
+                    .unwrap(),
+                )
+                .unwrap();
+                let (origin, scale, angle) = if name == "blend_stack" && index > 0 {
+                    if index == 1 {
+                        ("6.47 3.73 0", "0.53 0.48 1", 0.0)
+                    } else {
+                        ("5.19 4.61 0", "0.43 0.39 1", 0.57)
+                    }
+                } else {
+                    ("5.73 4.11 0", "0.71 0.55 1", rotation)
+                };
+                objects.push(json!({"id": index + 1, "name": format!("{name}/{index}"),
+                    "image": format!("models/{index}.json"), "origin": origin,
+                    "scale": scale, "angles": format!("0 0 {angle}")}));
+            }
+            let scene_path = root.path().join("scene.json");
+            fs::write(
+                &scene_path,
+                serde_json::to_vec(&json!({
+                    "camera": {"center": "0 0 -1", "eye": "0 0 0", "up": "0 1 0"},
+                    "general": {"bloom": false, "clearcolor": "0.07 0.16 0.31",
+                        "orthogonalprojection": {"width": 12, "height": 8}},
+                    "objects": objects
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let scene = crate::scene::load(&scene_path, root.path(), &properties).unwrap();
+            assert_eq!(scene.profile().layers.len(), objects.len(), "{name}");
+            for layer in &scene.profile().layers {
+                match &layer.material {
+                    MaterialProfile::Flag { colors, .. } => {
+                        assert!(name.starts_with("flag/"));
+                        assert_eq!(colors.background, properties["schemecolor"]);
+                        assert_eq!(colors.accent1, properties["flagcolor1"]);
+                        assert_eq!(colors.accent2, properties["flagcolor2"]);
+                    }
+                    MaterialProfile::Flow { bias, .. } => {
+                        assert!(name.starts_with("flowimage_2tex/"));
+                        assert_eq!(*bias, [0.29, 0.61]);
+                    }
+                    MaterialProfile::FlowLayers { bias, .. } => {
+                        assert!(name.starts_with("flowimage_4tex/"));
+                        assert_eq!(*bias, [0.29, 0.61]);
+                    }
+                    MaterialProfile::Sway { .. } => assert!(name.starts_with("swayimage/")),
+                    MaterialProfile::Generic { .. } => {
+                        assert!(name.starts_with("generic_") || name.ends_with("stack"));
+                    }
+                }
+            }
+            let gpu_scene = GpuScene::new(gl, &scene).unwrap();
+            let mut case_max = [0u8; 4];
+            let mut case_mean = [0.0f64; 3];
+            let failure_start = failures.len();
+            for (width, height) in [(37, 23), (31, 29)] {
+                for fit in [Fit::Cover, Fit::Contain] {
+                    let mut first = None;
+                    let mut animated_cpu = false;
+                    let mut animated_gpu = false;
+                    for time in [0.0, 0.37, 0.8, 1.6, 2.25] {
+                        let mut cpu = scene.render(width, height, fit, time).unwrap();
+                        for pixel in cpu.as_chunks_mut::<4>().0 {
+                            pixel.swap(0, 2); // Scene::render is BGRA; readback is already top-down RGBA.
+                        }
+                        let gpu = render_pixels(gl, width, height, || {
+                            renderer
+                                .draw_scene(gl, &gpu_scene, time, width, height, fit)
+                                .unwrap();
+                        });
+                        check_gl(gl).unwrap();
+                        let label = format!("{name} {width}x{height} {fit:?} t={time}");
+                        let clear = [18, 41, 79, 255];
+                        let colors: std::collections::BTreeSet<_> =
+                            cpu.as_chunks::<4>().0.iter().collect();
+                        assert!(colors.len() >= 16, "vacuous colors: {label}");
+                        assert!(
+                            cpu.as_chunks::<4>().0.contains(&clear),
+                            "no clear background: {label}"
+                        );
+                        if ordinary {
+                            assert!(
+                                cpu.as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .all(|p| p[..3].iter().all(|&c| c > 0 && c < 255)),
+                                "ordinary fixture unexpectedly saturated: {label}"
+                            );
+                        }
+                        let mut max = [0u8; 4];
+                        let mut sum = [0u64; 3];
+                        let mut shaded = 0usize;
+                        let mut coverage = 0usize;
+                        let mut worst = (0u8, 0usize);
+                        for (index, (actual, expected)) in gpu
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .zip(cpu.as_chunks::<4>().0)
+                            .enumerate()
+                        {
+                            // Keep every border pixel. Clear/content disagreements are
+                            // reported separately, never hidden by a shader tolerance.
+                            coverage += usize::from((*actual == clear) != (*expected == clear));
+                            shaded += usize::from(*expected != clear);
+                            for channel in 0..4 {
+                                let error = actual[channel].abs_diff(expected[channel]);
+                                max[channel] = max[channel].max(error);
+                                if channel < 3 && *expected != clear {
+                                    sum[channel] += u64::from(error);
+                                }
+                                if error > worst.0 {
+                                    worst = (error, index);
+                                }
+                            }
+                        }
+                        assert!(
+                            shaded >= (width * height / 10) as usize,
+                            "vacuous coverage: {label}"
+                        );
+                        let mean = sum.map(|n| n as f64 / shaded as f64);
+                        for channel in 0..4 {
+                            case_max[channel] = case_max[channel].max(max[channel]);
+                            if channel < 3 {
+                                case_mean[channel] = case_mean[channel].max(mean[channel]);
+                            }
+                        }
+                        // Four UNORM8 steps allow hardware bilinear precision,
+                        // shader arithmetic and final rounding, not semantic drift.
+                        // Mean is per RGB channel over content, not diluted by clear.
+                        if coverage != 0
+                            || max[..3].iter().any(|&n| n > 4)
+                            || max[3] != 0
+                            || mean.iter().any(|&n| n > 0.75)
+                        {
+                            let offset = worst.1 * 4;
+                            failures.push(format!("{label}: max_rgba={max:?}, mean_rgb={mean:.3?}, clear/content_mismatches={coverage}, worst=({}, {}) cpu={:?} gpu={:?}",
+                                worst.1 % width as usize, worst.1 / width as usize,
+                                &cpu[offset..offset + 4], &gpu[offset..offset + 4]));
+                        }
+                        if let Some((cpu_first, gpu_first)) = &first {
+                            animated_cpu |= cpu != *cpu_first;
+                            animated_gpu |= gpu != *gpu_first;
+                        } else {
+                            first = Some((cpu, gpu));
+                        }
+                    }
+                    assert!(
+                        animated_cpu,
+                        "vacuous animation: {name} {width}x{height} {fit:?}"
+                    );
+                    if !animated_gpu {
+                        failures.push(format!(
+                            "{name} {width}x{height} {fit:?}: GPU animation is constant"
+                        ));
+                    }
+                }
+            }
+            eprintln!(
+                "scene parity {name}: 20 frames, max_rgba={case_max:?}, max_mean_rgb={case_mean:.3?}, failures={}",
+                failures.len() - failure_start
+            );
+            gpu_scene.destroy(gl);
+        }
+        failures
+    }
+
+    fn scene_target_regressions(gl: &glow::Context, renderer: &mut Renderer) {
+        let scene = GpuScene {
+            clear: [0.2, 0.4, 0.6],
+            projection: [3, 2],
+            layers: Vec::new(),
+        };
+        let pixels = render_pixels(gl, 8, 6, || {
+            let draw = unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+            let read = unsafe { gl.create_framebuffer() }.unwrap();
+            unsafe {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read));
+                gl.viewport(2, 1, 4, 3);
+                gl.enable(glow::SCISSOR_TEST);
+                gl.scissor(3, 1, 2, 3);
+                gl.color_mask(false, true, false, false);
+            }
+            let assert_state = |viewport: [i32; 4]| unsafe {
+                assert_eq!(gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING), draw);
+                assert_eq!(
+                    gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING) as u32,
+                    read.0.get()
+                );
+                let mut actual = [0; 4];
+                gl.get_parameter_i32_slice(glow::VIEWPORT, &mut actual);
+                assert_eq!(actual, viewport);
+                gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut actual);
+                assert_eq!(actual, [3, 1, 2, 3]);
+                assert!(gl.is_enabled(glow::SCISSOR_TEST));
+                gl.get_parameter_i32_slice(glow::COLOR_WRITEMASK, &mut actual);
+                assert_eq!(actual, [0, 1, 0, 0]);
+            };
+            renderer
+                .draw_scene(gl, &scene, 0.0, 4, 3, Fit::Contain)
+                .unwrap();
+            assert_state([2, 1, 4, 3]);
+            let cached = renderer.scene_target.as_ref().unwrap().texture;
+            renderer
+                .draw_scene(gl, &scene, 0.25, 4, 3, Fit::Cover)
+                .unwrap();
+            assert_eq!(renderer.scene_target.as_ref().unwrap().texture, cached);
+            assert_state([2, 1, 4, 3]);
+
+            assert!(
+                renderer
+                    .draw_scene(gl, &scene, 0.0, 4097, 4096, Fit::Cover)
+                    .is_err()
+            );
+            assert_eq!(renderer.scene_target.as_ref().unwrap().texture, cached);
+            assert_state([2, 1, 4, 3]);
+            let max_size = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
+            assert!(
+                renderer
+                    .draw_scene(gl, &scene, 0.0, max_size + 1, 1, Fit::Cover)
+                    .is_err()
+            );
+            assert_state([2, 1, 4, 3]);
+
+            // Allocation failures restore caller state and do not poison a retry.
+            unsafe { gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 3) };
+            assert!(
+                renderer
+                    .draw_scene(gl, &scene, 0.0, 5, 4, Fit::Cover)
+                    .is_err()
+            );
+            assert_state([2, 1, 4, 3]);
+            check_gl(gl).unwrap();
+            unsafe { gl.viewport(1, 1, 6, 4) };
+            renderer
+                .draw_scene(gl, &scene, 0.0, 6, 4, Fit::Cover)
+                .unwrap();
+            let target = renderer.scene_target.as_ref().unwrap();
+            assert_eq!((target.width, target.height), (6, 4));
+            assert_state([1, 1, 6, 4]);
+            unsafe {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                gl.delete_framebuffer(read);
+            }
+        });
+        for y in 0..6usize {
+            for x in 0..8usize {
+                let expected = if (3..5).contains(&x) && (1..4).contains(&(5 - y)) {
+                    [51, 102, 153, 255]
+                } else {
+                    [255, 0, 255, 64]
+                };
+                assert_pixel(&pixels[(y * 8 + x) * 4..][..4], expected);
+            }
+        }
+    }
+
     fn real_gpu_regressions(embedded: bool) {
         let _lock = EGL_LOCK.lock().unwrap();
         let Some(context) = TestEgl::new(embedded) else {
@@ -1742,7 +2432,11 @@ mod tests {
         .expect("mismatched vertex/fragment varyings must fail linking");
         assert!(link_error.to_string().contains("program link failed"));
         assert!(Program::new(gl, IMAGE_FRAGMENT, &["u_missing"]).is_err());
-        let renderer = Renderer::new(gl).unwrap();
+        let mut renderer = Renderer::new(gl).unwrap();
+        assert!(
+            renderer.scene_target.is_none(),
+            "images and video need no float target"
+        );
         check_gl(gl).unwrap();
 
         let pbo = unsafe {
@@ -1994,12 +2688,27 @@ mod tests {
         unsafe { gl.delete_texture(recovered) };
         assert_unpack();
         video.destroy(gl);
+        let parity_failures = real_scene_parity(gl, &mut renderer);
+        scene_target_regressions(gl, &mut renderer);
+        assert_unpack();
+        let target = renderer.scene_target.as_ref().unwrap();
+        let target_handles = (target.framebuffer, target.texture);
         renderer.destroy(gl);
         unsafe {
+            assert!(!gl.is_framebuffer(target_handles.0));
+            assert!(!gl.is_texture(target_handles.1));
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
             gl.delete_buffer(pbo);
         }
         check_gl(gl).unwrap();
+        drop(context);
+        drop(_lock);
+        assert!(
+            parity_failures.is_empty(),
+            "{} scene parity failures:\n{}",
+            parity_failures.len(),
+            parity_failures.join("\n")
+        );
     }
 
     #[test]

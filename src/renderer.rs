@@ -232,7 +232,7 @@ fn draw_content(
         image,
         video,
     } = &mut *state;
-    let renderer = renderer.as_ref().unwrap();
+    let renderer = renderer.as_mut().unwrap();
     let viewport = info.viewport_in_pixels();
     let width = u32::try_from(viewport.width_px).context("paint viewport has no width")?;
     let height = u32::try_from(viewport.height_px).context("paint viewport has no height")?;
