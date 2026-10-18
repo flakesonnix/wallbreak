@@ -1,8 +1,8 @@
 {
   "uuid": "wallbreak@flakesonnix.github.io",
   "name": "Wallbreak",
-  "description": "Optional, local Wallbreak renderer bridge for the GNOME desktop and overview",
+  "description": "Optional, local Wallbreak renderer bridge for the GNOME desktop, workspace switches and overview",
   "shell-version": ["50"],
   "url": "https://github.com/flakesonnix/wallbreak",
-  "version": 2
+  "version": 3
 }

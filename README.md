@@ -85,6 +85,17 @@ These are explicit user actions, not automatic setup. Existing extension copies
 are not overwritten by this install command. GNOME may require signing out and
 back in to discover a new extension or reload previously imported code.
 
+Extension version **3** includes workspace-swipe background coverage. Existing
+installations need an explicit update; updating the Rust binary alone does not
+replace the Shell extension. Back up any locally modified extension directory
+before replacing it with the archive:
+
+```bash
+gnome-extensions install --force "$(nix run .#cli -- gnome-extension)"
+```
+
+Sign out and back in afterward, then check the reported extension version.
+
 Check activation before playing:
 
 ```bash
@@ -112,11 +123,21 @@ cannot add a VSync wait to graceful shutdown.
 The desktop clone stays attached and privacy-gated during overview transitions;
 GNOME's native parent groups control the crossfade instead of the bridge hiding
 the desktop animation as soon as the overview starts opening.
+Native workspace-switch backgrounds also receive selected-monitor clones, so
+left/right desktop swipes do not rely on the stationary desktop actor. They use
+native parent clipping rather than the overview-card mask. One owned
+`Meta.LaterType.BEFORE_REDRAW` callback crosses native constructor completion
+before painting, instead of ordinary idle scheduling during animation.
 
 After updating the extension files, previously loaded Shell modules remain
 cached until the next login; toggling enable/disable does not reload their code.
 Overview behavior has simulated lifecycle/geometry regression coverage; live
 GPU clipping and appearance still require checking after that reload.
+Workspace-transition ownership and construction order were checked against the
+shipped GNOME Shell 50.2 `workspaceAnimation.js`, `workspace.js`, and
+`background.js`; scheduling uses Mutter 50.2's `Meta.Laters` before-redraw API.
+The corresponding transition-background ownership shape was also inspected in
+50.4. This is static source verification, not a recorded visual swipe test.
 Overview cards use additional cloned surfaces and a rounded clipping effect;
 their GPU/memory cost has not been benchmarked.
 
@@ -429,7 +450,13 @@ rendering-performance comparison or a 4K/60-fps claim.
 - [ ] Add an EGL GPU presenter for `wlr-layer-shell` with automatic CPU/SHM
   fallback and an explicit `--software` override.
 - [ ] Check real GNOME 50 playback after a Shell reload: scene/video appearance,
-  fit/scaling, monitor selection, desktop/overview clipping, and Stop cleanup.
+  fit/scaling, monitor selection, left/right swipes on the desktop and in the
+  overview, clipping, and Stop cleanup.
+- [ ] Animate Midnight Kirby's native Shake/water effects, including RG8/R8
+  masks and ordered layer-local passes; current support renders its base images.
+- [ ] Add actual 3D support for Fantastic Car; it needs MDLV0014 meshes,
+  perspective camera/material rendering and reflection-target handling, not a
+  preview substitution.
 - [x] Add fixed-time synthetic CPU/GPU comparisons for flag, flow, sway, and
   generic materials across representative constants, rotation, blending, and fit.
 - [ ] Extend parity checks to hardware drivers, exact raster-edge ties, and

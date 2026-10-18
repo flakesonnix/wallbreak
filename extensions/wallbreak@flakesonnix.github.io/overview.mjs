@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
-import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
@@ -9,6 +8,7 @@ import St from 'gi://St';
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
+import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 
 // Independently authored signed-distance mask, not Mutter's content shader.
 // BackgroundContent clips its own pixels, not a BackgroundActor's children.
@@ -78,6 +78,7 @@ export class OverviewClones {
         this._failed = false;
         this._allowed = false;
         this._overviewVisible = false;
+        this._laters = global.compositor.get_laters();
         this._hook = null;
         this._signals = [];
         // Actor identity includes the manager's current, pending and fading actors.
@@ -122,11 +123,16 @@ export class OverviewClones {
             backdrop.clone.set_size(width, height);
             Main.layoutManager.overviewGroup.insert_child_at_index(backdrop.clone, 0);
 
-            // Hook first; backfill without recreating backgrounds or toggling overview.
+            // Hook first; backfill native cards and an already-running desktop swipe.
+            const seen = new Set();
             const visit = actor => {
-                if (actor instanceof Workspace.WorkspaceBackground) {
+                if (seen.has(actor))
+                    return;
+                seen.add(actor);
+                if (actor instanceof Workspace.WorkspaceBackground ||
+                    actor instanceof WorkspaceAnimation.WorkspaceBackground) {
                     const manager = actor._bgManager;
-                    if (manager?._container === actor._backgroundGroup) {
+                    if (manager?._container) {
                         for (const child of manager._container.get_children())
                             this._attach(manager, child);
                     }
@@ -135,6 +141,7 @@ export class OverviewClones {
                     visit(child);
             };
             visit(Main.layoutManager.overviewGroup);
+            visit(Main.uiGroup);
             this._sync();
         });
     }
@@ -151,26 +158,37 @@ export class OverviewClones {
             Main.layoutManager.monitors[this._index] === this._monitor;
     }
 
-    _workspaceOwner(manager, actor) {
+    _backgroundOwner(manager, actor) {
         if (!this._monitorCurrent() || manager._monitorIndex !== this._index ||
             manager._layoutManager !== Main.layoutManager ||
             !(actor instanceof Meta.BackgroundActor) || actor.monitor !== this._index)
             return null;
         const group = manager._container;
-        const bin = group?.get_parent();
-        const owner = bin?.get_parent();
+        if (actor.get_parent() !== group)
+            return null;
+        const parent = group?.get_parent();
+        if (parent instanceof WorkspaceAnimation.WorkspaceBackground) {
+            if (!(group instanceof Meta.BackgroundGroup) ||
+                !(parent._workspace instanceof Meta.Workspace) ||
+                parent._monitor !== this._monitor || parent._monitor.index !== this._index ||
+                (parent._bgManager !== undefined && parent._bgManager !== manager))
+                return null;
+            return {owner: parent, kind: 'transition'};
+        }
+        const owner = parent?.get_parent();
         if (!(owner instanceof Workspace.WorkspaceBackground) ||
-            owner._monitorIndex !== this._index || owner._bin !== bin ||
-            owner._backgroundGroup !== group || actor.get_parent() !== group ||
+            owner._monitorIndex !== this._index || owner._bin !== parent ||
+            owner._backgroundGroup !== group ||
             (owner._bgManager !== undefined && owner._bgManager !== manager))
             return null;
         // _bgManager is assigned only after the factory returns during construction.
-        return owner;
+        return {owner, kind: 'card'};
     }
 
-    _newRecord(background, manager = null, owner = null) {
-        const record = {background, manager, owner, clone: null, effect: null,
-            constraint: null, signals: [], idle: 0, retired: false};
+    _newRecord(background, manager = null, identity = null) {
+        const record = {background, manager, owner: identity?.owner ?? null,
+            kind: identity?.kind ?? 'backdrop', clone: null, effect: null,
+            constraint: null, signals: [], later: 0, retired: false};
         this._records.set(background, record);
         record.clone = new Clutter.Clone({
             source: this._source, reactive: false, visible: false,
@@ -194,38 +212,43 @@ export class OverviewClones {
             this._sync();
             return;
         }
-        const owner = this._workspaceOwner(manager, background);
-        if (!owner || this._records.has(background))
+        const identity = this._backgroundOwner(manager, background);
+        if (!identity || this._records.has(background))
             return;
-        const record = this._newRecord(background, manager, owner);
+        const {owner, kind} = identity;
+        const record = this._newRecord(background, manager, identity);
         record.constraint = new Clutter.BindConstraint({
             source: background, coordinate: Clutter.BindCoordinate.SIZE, offset: 0,
         });
         record.clone.add_constraint(record.constraint);
-        record.effect = new CardMask();
-        record.clone.add_effect(record.effect);
+        if (kind === 'card') {
+            record.effect = new CardMask();
+            record.clone.add_effect(record.effect);
+        }
         this._connect(record.signals, background, 'destroy', () => this._cleanupRecord(record));
         this._connect(record.signals, owner, 'destroy', () => this._cleanupRecord(record));
-        this._connect(record.signals, background, 'parent-set', () => this._syncCard(record));
-        this._connect(record.signals, background, 'notify::allocation', () => this._syncCard(record));
-        this._connect(record.signals, owner, 'notify::allocation', () => this._syncCard(record));
-        // This property is bound by native code to the owner's adjustment.
-        this._connect(record.signals, owner, 'notify::state-adjustment-value', () => this._syncCard(record));
+        this._connect(record.signals, background, 'parent-set', () => this._syncBackground(record));
+        this._connect(record.signals, background, 'notify::allocation', () => this._syncBackground(record));
+        this._connect(record.signals, owner, 'notify::allocation', () => this._syncBackground(record));
+        if (kind === 'card') {
+            // Only overview cards have the native rounded-corner adjustment.
+            this._connect(record.signals, owner, 'notify::state-adjustment-value', () => this._syncBackground(record));
+        }
         background.add_child(record.clone);
-        // One owned idle crosses the synchronous native constructor/assignment.
-        // Missing fields remain hidden, with allocation/state signals providing backfill.
-        record.idle = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            record.idle = 0;
+        // Cross the constructor's field assignment before the first frame, not
+        // in an idle that continuous animations can defer until after painting.
+        record.later = this._laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+            record.later = 0;
             if (record.retired)
                 this._attempt(() => this._cleanupRecord(record));
             else if (this._active)
-                this._attempt(() => this._syncCard(record));
-            return GLib.SOURCE_REMOVE;
+                this._attempt(() => this._syncBackground(record));
+            return false;
         });
-        this._syncCard(record);
+        this._syncBackground(record);
     }
 
-    _syncCard(record) {
+    _syncBackground(record) {
         if (record.retired || !record.clone)
             return;
         const {owner, background, manager} = record;
@@ -233,8 +256,21 @@ export class OverviewClones {
             record.clone.visible = false;
             return;
         }
-        if (this._workspaceOwner(manager, background) !== owner) {
+        const identity = this._backgroundOwner(manager, background);
+        if (identity?.owner !== owner || identity.kind !== record.kind) {
             this._cleanupRecord(record);
+            return;
+        }
+        if (owner._bgManager !== manager) {
+            record.clone.visible = false;
+            return;
+        }
+        if (record.kind === 'transition') {
+            // The native full-monitor parent owns clipping and movement. The
+            // SIZE constraint allocates our child with the first native frame.
+            record.clone.visible = this._allowed &&
+                [this._monitor.width, this._monitor.height].every(Number.isFinite) &&
+                this._monitor.width > 0 && this._monitor.height > 0;
             return;
         }
         const workarea = owner._workarea;
@@ -242,7 +278,7 @@ export class OverviewClones {
         const scale = St.ThemeContext.get_for_stage(global.stage).scaleFactor;
         // Meta 18 has no rounded-bounds getter. Use the native owner's parsed
         // workarea and GNOME 50.2's 30 * theme scale * adjustment radius contract.
-        if (owner._bgManager !== manager || !workarea ||
+        if (!workarea ||
             ![workarea.x, workarea.y, workarea.width, workarea.height, state, scale,
                 this._monitor.x, this._monitor.y, this._monitor.width, this._monitor.height,
                 background.width, background.height].every(Number.isFinite) ||
@@ -259,7 +295,7 @@ export class OverviewClones {
     _sync() {
         for (const record of this._records.values()) {
             if (record.background) {
-                this._syncCard(record);
+                this._syncBackground(record);
             } else if (record.clone && !record.retired) {
                 record.clone.visible = this._active && this._allowed &&
                     this._overviewVisible && Boolean(this._monitorCurrent());
@@ -323,10 +359,10 @@ export class OverviewClones {
                 errors.push(error);
             }
         };
-        if (record.idle) {
+        if (record.later) {
             release(() => {
-                GLib.source_remove(record.idle);
-                record.idle = 0;
+                this._laters.remove(record.later);
+                record.later = 0;
             });
         }
         this._disconnect(record.signals, errors);
@@ -354,7 +390,7 @@ export class OverviewClones {
                 forgetSignals(record.signals, clone);
             });
         }
-        if (!record.clone && !record.idle && record.signals.length === 0)
+        if (!record.clone && !record.later && record.signals.length === 0)
             this._records.delete(record.background);
         if (errors.length)
             throw new Error(`Overview clone cleanup failed: ${errors.map(error => error.message).join('; ')}`);

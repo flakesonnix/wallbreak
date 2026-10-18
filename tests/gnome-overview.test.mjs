@@ -1,6 +1,10 @@
 // Run: node --experimental-vm-modules --test tests/gnome-overview.test.mjs
-// Simulated Shell/GI boundaries, not live overview or pixel verification.
-// API basis: GNOME Shell 50.2 workspace.js/background.js and Meta/Clutter 18 GIR;
+// Simulated Shell/GI boundaries, not live desktop/overview swipe or pixel verification.
+// API basis: static GNOME Shell 50.2 workspaceAnimation.js/workspace.js/background.js
+// and Meta/Clutter 18 GIR. Transition owners set workspace/monitor, size and clipping
+// before creating their direct Meta.BackgroundGroup child; the native factory
+// attaches its actor before the constructor assigns the owner's _bgManager.
+// Mutter 50.2 headers define Meta.Laters.add/remove and BEFORE_REDRAW = 4;
 // read-only GJS reflection confirmed Shell.GLSLEffect.set_uniform_float(loc, n, values),
 // connect_after, parent-set (not notify::parent), BindCoordinate.SIZE and no bounds getter.
 // layout.js leaves overviewGroup's St.Widget layout unspecified; its reflected
@@ -146,23 +150,40 @@ async function harness({open = false, beforeHook = null, onError = null,
     const clones = [];
     const effects = [];
     const errors = [];
-    const idles = new Map();
+    const laters = new Map();
     const calls = [];
     const display = new Signals();
     const theme = Object.assign(new Signals(), {scaleFactor: 2});
+    const uiGroup = new Actor({name: 'native-ui-group'});
     const overviewGroup = new Actor({visible: open, layout_manager: new FixedLayout()});
+    uiGroup.add_child(overviewGroup);
     const controls = new Actor({name: 'native-controls'});
     overviewGroup.add_child(controls);
-    const monitor = {...monitorGeometry};
+    const monitor = {...monitorGeometry, index: 0};
     const layoutManager = Object.assign(new Signals(), {
-        monitors: [monitor, {x: 0, y: 0, width: 2560, height: 1440}], overviewGroup,
+        monitors: [monitor, {index: 1, x: 0, y: 0, width: 2560, height: 1440}], overviewGroup,
     });
     const sourceParent = new Actor({visible: false});
     const sourceActor = new Actor({opacity: 0});
     sourceParent.add_child(sourceActor);
-    let nextIdle = 0;
-    const h = {actors, clones, effects, errors, idles, calls, display, theme, monitor,
-        layoutManager, overviewGroup, controls, sourceActor, sourceParent};
+    let nextLater = 0;
+    const h = {actors, clones, effects, errors, laters, calls, display, theme, monitor,
+        layoutManager, uiGroup, overviewGroup, controls, sourceActor, sourceParent};
+    const compositorLaters = {
+        add(type, callback) {
+            assert.equal(type, 4, 'constructor readiness must run BEFORE_REDRAW');
+            if (h.laterAddError)
+                throw new Error('later scheduling failed');
+            const id = ++nextLater;
+            laters.set(id, callback);
+            return id;
+        },
+        remove(id) {
+            if (h.laterRemoveError)
+                throw new Error('later removal failed');
+            assert.ok(laters.delete(id), 'only remove a live owned later');
+        },
+    };
     class Clone extends Actor {
         constructor(properties) {
             if (h.cloneError)
@@ -173,17 +194,24 @@ async function harness({open = false, beforeHook = null, onError = null,
     }
     class BackgroundActor extends Actor {
         constructor(index) {
-            super({monitor: index, content: {rounded_clip_radius: 0,
+            super({monitor: index, opacity: 255, content: {rounded_clip_radius: 0,
                 vignette: false, brightness: 0.5, nativeBackground: {}}});
             actors.push(this);
         }
     }
+    class BackgroundGroup extends Actor {}
+    class MetaWorkspace {
+        constructor(index) { this._index = index; }
+        index() { return this._index; }
+    }
+    const workspaces = [new MetaWorkspace(0), new MetaWorkspace(1)];
     // Models the producing boundary, including factory-before-field assignment.
     // It is not GNOME's implementation and intentionally has no settings/window API.
     class BackgroundManager {
-        constructor(container, index = 0) {
+        constructor(container, index = 0, controlPosition = true) {
             Object.assign(this, {_container: container, _monitorIndex: index,
-                _layoutManager: layoutManager, _settingsSchema: 'org.gnome.desktop.background'});
+                _layoutManager: layoutManager, _controlPosition: controlPosition,
+                _settingsSchema: 'org.gnome.desktop.background'});
             this.backgroundActor = this._createBackgroundActor('construct', {index});
             this._newBackgroundActor = null;
         }
@@ -218,12 +246,12 @@ async function harness({open = false, beforeHook = null, onError = null,
             this._workarea = {x: monitor.x + 16, y: monitor.y + 32, width: 1880, height: 1020};
             this._stateAdjustment = {value: 0.75};
             this._bin = new Actor({clip_to_allocation: true});
-            this._backgroundGroup = new Actor();
+            this._backgroundGroup = new BackgroundGroup();
             this._bin.add_child(this._backgroundGroup);
             this.add_child(this._bin);
             // Native binding exists before the background manager is constructed.
             this.state_adjustment_value = 0.75;
-            const manager = new BackgroundManager(this._backgroundGroup, index);
+            const manager = new BackgroundManager(this._backgroundGroup, index, false);
             if (!incomplete)
                 this._bgManager = manager;
             if (parent)
@@ -241,6 +269,23 @@ async function harness({open = false, beforeHook = null, onError = null,
             this.state_adjustment_value = value;
             this.emit('notify::state-adjustment-value');
         }
+    }
+    class TransitionBackground extends Actor {
+        constructor({index = 0, parent = uiGroup, workspace = workspaces[0],
+            monitor = layoutManager.monitors[index], incomplete = false} = {}) {
+            super({width: monitor.width, height: monitor.height, clip_to_allocation: true});
+            this._workspace = workspace;
+            this._monitor = monitor;
+            const group = new BackgroundGroup();
+            this.add_child(group);
+            const manager = new BackgroundManager(group, monitor.index, false);
+            if (!incomplete)
+                this._bgManager = manager;
+            if (parent)
+                parent.add_child(this);
+            this.manager = manager;
+        }
+        get workspace() { return this._workspace; }
     }
     class GLSLEffect {
         constructor() { this._init(); }
@@ -266,14 +311,16 @@ async function harness({open = false, beforeHook = null, onError = null,
         }
         queue_repaint() { this.repaints = (this.repaints ?? 0) + 1; }
     }
-    Object.assign(h, {BackgroundManager, BackgroundActor, WorkspaceBackground});
+    Object.assign(h, {BackgroundManager, BackgroundActor, BackgroundGroup,
+        WorkspaceBackground, TransitionBackground, workspaces});
     const original = Object.getOwnPropertyDescriptor(BackgroundManager.prototype, '_createBackgroundActor');
     if (beforeHook)
         beforeHook(BackgroundManager.prototype, original.value);
     h.originalDescriptor = Object.getOwnPropertyDescriptor(BackgroundManager.prototype, '_createBackgroundActor');
     const warnings = [];
     h.warnings = warnings;
-    const context = vm.createContext({global: {display, stage: {}},
+    const context = vm.createContext({global: {display, stage: {},
+        compositor: {get_laters: () => compositorLaters}},
         console: {error: message => warnings.push(message)}});
     const modules = new Map([
         ['gi://Clutter', {default: {Clone, BindConstraint: class {
@@ -281,27 +328,15 @@ async function harness({open = false, beforeHook = null, onError = null,
         }, BindCoordinate: {SIZE: 5}}}],
         ['gi://Cogl', {default: {SnippetHook: {FRAGMENT: 2048}}}],
         ['gi://GObject', {default: {registerClass: type => type}}],
-        ['gi://Meta', {default: {BackgroundActor}}],
+        ['gi://Meta', {default: {BackgroundActor, BackgroundGroup, Workspace: MetaWorkspace,
+            LaterType: {BEFORE_REDRAW: 4}}}],
         ['gi://Shell', {default: {GLSLEffect}}],
         ['gi://St', {default: {ThemeContext: {get_for_stage: () => theme}}}],
-        ['gi://GLib', {default: {PRIORITY_DEFAULT_IDLE: 200, SOURCE_REMOVE: false,
-            idle_add: (priority, callback) => {
-                assert.equal(priority, 200);
-                if (h.idleAddError)
-                    throw new Error('idle scheduling failed');
-                const id = ++nextIdle;
-                idles.set(id, callback);
-                return id;
-            },
-            source_remove: id => {
-                if (h.idleRemoveError)
-                    throw new Error('idle removal failed');
-                assert.ok(idles.delete(id), 'only remove a live owned source');
-                return true;
-            }}}],
         ['resource:///org/gnome/shell/ui/background.js', {BackgroundManager}],
-        ['resource:///org/gnome/shell/ui/main.js', {layoutManager}],
+        ['resource:///org/gnome/shell/ui/main.js', {layoutManager, uiGroup}],
         ['resource:///org/gnome/shell/ui/workspace.js', {WorkspaceBackground}],
+        ['resource:///org/gnome/shell/ui/workspaceAnimation.js',
+            {WorkspaceBackground: TransitionBackground}],
     ]);
     const module = new vm.SourceTextModule(source, {context});
     await module.link(specifier => {
@@ -318,9 +353,9 @@ async function harness({open = false, beforeHook = null, onError = null,
         onError?.(h, error);
     });
     h.flush = () => {
-        // Exactly one bounded idle turn, not a polling loop.
-        for (const [id, callback] of [...idles]) {
-            if (idles.delete(id))
+        // Exactly one before-redraw turn, not a polling loop or a real compositor.
+        for (const [id, callback] of [...laters]) {
+            if (laters.delete(id))
                 assert.equal(callback(), false);
         }
     };
@@ -328,7 +363,7 @@ async function harness({open = false, beforeHook = null, onError = null,
     h.card = background => background.children.find(child => child instanceof Clone);
     h.assertClean = () => {
         assert.equal(h.owner.hasResources, false);
-        assert.equal(idles.size, 0);
+        assert.equal(laters.size, 0);
         assert.equal(theme.handlers.size, 0);
         assert.equal(display.handlers.size, 0);
         assert.equal(layoutManager.handlers.size, 0);
@@ -342,7 +377,9 @@ async function harness({open = false, beforeHook = null, onError = null,
         }
         assert.equal(sourceActor.parent, sourceParent);
         assert.equal(sourceActor.opacity, 0);
+        assert.equal(sourceParent.visible, false);
         assert.ok(!sourceActor.destroyed);
+        assert.equal(overviewGroup.parent, uiGroup);
         assert.deepEqual(overviewGroup.children, [controls]);
         assert.deepEqual(Object.getOwnPropertyDescriptor(BackgroundManager.prototype,
             '_createBackgroundActor'), h.originalDescriptor);
@@ -373,7 +410,7 @@ test('factory posthook preserves this/args/return, construction timing and nativ
     h.owner.setVisibility(true, true);
     assert.equal(clone.visible, true);
     h.flush();
-    assert.equal(h.idles.size, 0);
+    assert.equal(h.laters.size, 0);
     assert.equal(h.clones.length, 2, 'deferred backfill must deduplicate');
     h.owner.destroy();
     h.assertClean();
@@ -421,6 +458,213 @@ test('backfills current, pending and fading card backgrounds when overview is al
     assert.equal(h.clones.filter(clone => !clone.destroyed).length, 3);
     h.owner.destroy();
     h.assertClean();
+});
+
+test('two native transition backgrounds follow horizontal swipes without overview visibility or a card mask', async () => {
+    for (const open of [false, true]) {
+        const h = await harness({open});
+        const monitorGroup = new Actor({x: h.monitor.x, y: h.monitor.y,
+            width: h.monitor.width, height: h.monitor.height, clip_to_allocation: true});
+        const swipe = new Actor();
+        h.uiGroup.add_child(monitorGroup);
+        monitorGroup.add_child(swipe);
+        h.owner.start();
+        h.owner.setVisibility(true, open);
+        h.maskError = h.uniformError = true;
+        const entries = h.workspaces.map((workspace, index) => {
+            const parent = new Actor({x: index * 2120, clip_to_allocation: true});
+            swipe.add_child(parent);
+            const owner = new h.TransitionBackground({parent, workspace});
+            const manager = owner._bgManager;
+            const background = manager.backgroundActor;
+            const clone = h.card(background);
+            assert.ok(clone, 'the factory attaches before native constructor completion');
+            assert.equal(clone.visible, false, 'wait for the owner manager assignment');
+            assert.equal(owner.workspace, workspace);
+            assert.equal(owner._monitor, h.monitor);
+            assert.ok(manager._container instanceof h.BackgroundGroup);
+            assert.equal(manager._container.parent, owner, 'no overview card bin');
+            assert.equal(manager._controlPosition, false);
+            assert.equal(background.parent, manager._container);
+            assert.equal(background.has_allocation(), false);
+            assert.equal(clone.source, h.sourceActor);
+            assert.equal(clone.reactive, false);
+            assert.equal(clone.constraints.length, 1);
+            assert.equal(clone.constraints[0].source, background);
+            assert.equal(clone.constraints[0].coordinate, 5);
+            assert.equal(clone.constraints[0].offset, 0);
+            assert.deepEqual(clone.effects, []);
+            return {owner, parent, background, clone, content: background.content};
+        });
+        h.flush();
+        assert.equal(h.laters.size, 0);
+        for (const {background, clone} of entries) {
+            assert.equal(background.has_allocation(), false);
+            assert.equal(clone.visible, true, 'SIZE binding is sufficient before the first allocation');
+        }
+        for (const x of [-1166, -424, 0, 424, 1166]) {
+            swipe.set_position(x, 0);
+            swipe.translation_x = x / 2;
+            for (const [index, {owner, parent, background, clone, content}] of entries.entries()) {
+                background.allocate(0, 0, 1920, 1080);
+                owner.emit('notify::allocation');
+                h.owner.setVisibility(true, open);
+                assert.equal(h.card(background), clone, 'direction changes retain actor identity');
+                assert.equal(clone.visible, true);
+                assert.deepEqual([clone.x, clone.y, clone.width, clone.height], [0, 0, 1920, 1080]);
+                assert.equal(clone.source, h.sourceActor);
+                assert.equal(owner.parent, parent);
+                assert.deepEqual([parent.x, parent.y], [index * 2120, 0]);
+                assert.deepEqual([owner.x, owner.y, owner.width, owner.height], [0, 0, 1920, 1080]);
+                assert.equal(owner.clip_to_allocation, true);
+                assert.equal(parent.clip_to_allocation, true);
+                assert.equal(background.content, content);
+                assert.deepEqual(content, {rounded_clip_radius: 0, vignette: false,
+                    brightness: 0.5, nativeBackground: {}});
+                assert.equal(background.opacity, 255);
+            }
+            assert.deepEqual([swipe.x, swipe.y, swipe.translation_x], [x, 0, x / 2]);
+            assert.equal(swipe.parent, monitorGroup);
+            assert.equal(monitorGroup.parent, h.uiGroup);
+            assert.deepEqual([monitorGroup.x, monitorGroup.y], [h.monitor.x, h.monitor.y]);
+            assert.equal(monitorGroup.clip_to_allocation, true);
+        }
+        for (const [allowed, overview] of [[false, false], [true, false],
+            [false, true], [true, true], [1, false], [true, false]]) {
+            h.owner.setVisibility(allowed, overview);
+            for (const {background, clone} of entries) {
+                assert.equal(h.card(background), clone);
+                assert.equal(clone.visible, allowed === true);
+            }
+            assert.equal(h.backdrop().visible, allowed === true && overview);
+        }
+        assert.equal(h.overviewGroup.visible, open, 'never toggle native overview');
+        assert.equal(h.sourceActor.parent, h.sourceParent);
+        assert.equal(h.sourceActor.opacity, 0);
+        assert.equal(h.sourceParent.visible, false);
+        assert.equal(h.clones.length, 3);
+        assert.equal(h.effects.length, 0, 'transition clipping belongs to native parents');
+        assert.equal(h.errors.length, 0);
+        h.owner.destroy();
+        h.assertClean();
+    }
+});
+
+test('before-redraw readiness needs manager assignment, not transition allocation, and never polls', async () => {
+    const h = await harness();
+    h.owner.start();
+    h.owner.setVisibility(true, false);
+    const ready = new h.TransitionBackground({parent: null, incomplete: true});
+    const unknown = new h.TransitionBackground({incomplete: true});
+    const background = ready.manager.backgroundActor;
+    const clone = h.card(background);
+    const unknownClone = h.card(unknown.manager.backgroundActor);
+    assert.equal(clone.visible, false);
+    assert.equal(unknownClone.visible, false);
+    assert.equal(h.laters.size, 2);
+    ready._bgManager = ready.manager;
+    h.flush();
+    assert.equal(clone.visible, true, 'constructor completes before the first paint');
+    assert.equal(background.has_allocation(), false);
+    assert.deepEqual([background.width, background.height], [0, 0]);
+    assert.equal(ready.parent, null, 'readiness does not depend on stage parenting');
+    assert.equal(unknownClone.visible, false, 'unknown manager stays fail-closed');
+    assert.equal(h.laters.size, 0);
+    h.flush();
+    h.owner.setVisibility(true, false);
+    assert.equal(h.laters.size, 0, 'no repeated readiness scheduling');
+    assert.equal(unknownClone.visible, false);
+    assert.equal(h.clones.length, 3);
+    assert.equal(h.errors.length, 0);
+    h.owner.destroy();
+    h.assertClean();
+    assert.equal(ready.handlers.size, 0);
+    assert.equal(unknown.handlers.size, 0);
+    assert.equal(background.handlers.size, 0);
+    assert.ok(!background.destroyed);
+});
+
+test('transition constructor scheduling failure stays inside the factory and cleans bounded partial resources', async () => {
+    const h = await harness({onError: owner => owner.owner.destroy()});
+    h.owner.start();
+    h.owner.setVisibility(true, false);
+    h.laterAddError = true;
+    let transition;
+    assert.doesNotThrow(() => { transition = new h.TransitionBackground(); });
+    const manager = transition._bgManager;
+    const background = manager.backgroundActor;
+    assert.equal(h.errors.length, 1);
+    assert.match(h.errors[0].message, /later scheduling failed/);
+    assert.equal(h.calls.length, 1);
+    assert.equal(background, h.actors[0], 'preserve the native factory result despite extension failure');
+    assert.equal(background.parent, manager._container);
+    assert.equal(manager._container.parent, transition);
+    assert.equal(background.has_allocation(), false);
+    assert.equal(transition.handlers.size, 0);
+    assert.equal(background.handlers.size, 0);
+    assert.ok(!background.destroyed);
+    h.flush();
+    h.assertClean();
+});
+
+test('playback starting mid-desktop-swipe backfills the UI root once, including fading and pending actors', async () => {
+    const h = await harness();
+    const swipe = new Actor({x: -848});
+    h.uiGroup.add_child(swipe);
+    const transition = new h.TransitionBackground({parent: swipe});
+    const manager = transition._bgManager;
+    const fading = manager.backgroundActor;
+    manager.pending();
+    manager.swap();
+    const current = manager.backgroundActor;
+    const pending = manager.pending();
+    fading.opacity = 96;
+    const card = new h.WorkspaceBackground();
+    const cardBackground = card._bgManager.backgroundActor;
+    const nativeChildren = [...manager._container.children];
+    const nativeFactoryCalls = h.calls.length;
+    let uiVisits = 0;
+    let overviewVisits = 0;
+    const uiChildren = h.uiGroup.get_children.bind(h.uiGroup);
+    const overviewChildren = h.overviewGroup.get_children.bind(h.overviewGroup);
+    h.uiGroup.get_children = () => {
+        uiVisits++;
+        assert.notEqual(h.BackgroundManager.prototype._createBackgroundActor,
+            h.originalDescriptor.value, 'hook is installed before UI-root enumeration');
+        return uiChildren();
+    };
+    h.overviewGroup.get_children = () => {
+        overviewVisits++;
+        return overviewChildren();
+    };
+    h.owner.start();
+    const backgrounds = [fading, current, pending, cardBackground];
+    const clones = backgrounds.map(background => h.card(background));
+    assert.ok(clones.every(clone => clone && !clone.visible), 'privacy is initially unknown');
+    h.owner.setVisibility(true, false);
+    assert.ok(clones.every(clone => clone.visible));
+    for (const background of [fading, current, pending]) {
+        assert.equal(background.has_allocation(), false);
+        assert.deepEqual(h.card(background).effects, []);
+    }
+    assert.equal(h.backdrop().visible, false);
+    assert.equal(h.overviewGroup.visible, false);
+    assert.equal(uiVisits, 1);
+    assert.equal(overviewVisits, 1, 'the overview subtree is also reachable through Main.uiGroup');
+    h.flush();
+    assert.equal(h.laters.size, 0);
+    assert.deepEqual(backgrounds.map(background => h.card(background)), clones);
+    assert.equal(h.clones.length, 5, 'current, pending and fading actors attach exactly once');
+    assert.equal(h.calls.length, nativeFactoryCalls, 'never recreate native backgrounds');
+    assert.deepEqual(manager._container.children, nativeChildren);
+    assert.equal(swipe.x, -848);
+    assert.equal(fading.opacity, 96, 'native crossfade remains native');
+    assert.equal(h.errors.length, 0);
+    h.owner.destroy();
+    h.assertClean();
+    assert.deepEqual(manager._container.children, nativeChildren);
+    assert.equal(transition.parent, swipe);
+    assert.equal(transition.handlers.size, 0);
 });
 
 test('local SIZE binding and mask follow native workarea, state, scale and allocation', async () => {
@@ -483,7 +727,7 @@ test('unknown mask geometry stays hidden; one deferred constructor backfill is b
     workspace.emit('notify::allocation');
     assert.equal(clone.visible, false);
     h.flush();
-    assert.equal(h.idles.size, 0, 'no unbounded geometry polling');
+    assert.equal(h.laters.size, 0, 'no unbounded geometry polling');
     for (const value of [NaN, -1, 2, undefined]) {
         workspace._workarea = {x: -1920, y: 212, width: 1920, height: 1048};
         workspace.state(value);
@@ -611,113 +855,195 @@ test('strict owner type and ancestry deny desktop, unlock, shield, login and loo
     h.assertClean();
 });
 
-test('monitor object replacement is rejected before monitors-changed, even at the same index', async () => {
+test('transition ownership rejects class lookalikes, foreign monitors and mismatched native identities', async () => {
     const h = await harness();
+    const existing = new h.TransitionBackground();
+    const manager = existing._bgManager;
+    const wrongActors = [new Actor({monitor: 0}), new h.BackgroundActor(1),
+        new h.BackgroundActor('0')];
+    for (const actor of wrongActors)
+        manager._container.add_child(actor);
+    const invalid = [new h.TransitionBackground({index: 1}),
+        new h.TransitionBackground({monitor: {...h.monitor}}),
+        new h.TransitionBackground({workspace: null}),
+        new h.TransitionBackground({workspace: {}})];
+    const wrongGroup = new h.TransitionBackground();
+    const plainGroup = new Actor();
+    wrongGroup.add_child(plainGroup);
+    wrongGroup._bgManager = new h.BackgroundManager(plainGroup, 0, false);
+    invalid.push(wrongGroup);
+    const Lookalike = class WorkspaceBackground extends Actor {};
+    const lookalike = new Lookalike();
+    lookalike._workspace = h.workspaces[0];
+    lookalike._monitor = h.monitor;
+    const group = new h.BackgroundGroup();
+    lookalike.add_child(group);
+    h.uiGroup.add_child(lookalike);
+    lookalike._bgManager = new h.BackgroundManager(group, 0, false);
     h.owner.start();
-    const existing = new h.WorkspaceBackground();
-    h.owner.setVisibility(true, true);
-    const clone = h.card(existing._bgManager.backgroundActor);
-    h.layoutManager.monitors[0] = {...h.monitor};
-    const replacement = new h.WorkspaceBackground();
-    assert.equal(h.card(replacement._bgManager.backgroundActor), undefined);
-    assert.equal(clone.visible, false);
-    assert.equal(h.backdrop().visible, false);
-    h.owner.setVisibility(true, true);
-    assert.equal(clone.visible, false);
-    h.layoutManager.emit('monitors-changed');
-    assert.equal(clone.visible, false);
+    h.owner.setVisibility(true, false);
+    const clone = h.card(manager.backgroundActor);
+    assert.ok(clone);
+    assert.equal(clone.visible, true);
+    assert.equal(clone.source, h.sourceActor);
+    for (const actor of wrongActors)
+        assert.equal(h.card(actor), undefined, 'native actor type and exact monitor index are required');
+    for (const owner of [...invalid, lookalike]) {
+        assert.equal(h.card(owner._bgManager.backgroundActor), undefined, 'deny invalid existing owners');
+        assert.equal(h.card(owner._bgManager.pending()), undefined, 'deny invalid factory owners');
+    }
+    const wrongManager = new h.BackgroundManager(manager._container, 0, false);
+    assert.equal(h.card(wrongManager.backgroundActor), undefined, 'must be the concrete owner manager');
+    manager._monitorIndex = '0';
+    assert.equal(h.card(manager.pending()), undefined, 'do not coerce manager monitor indexes');
+    manager._monitorIndex = 0;
+    manager._layoutManager = {...h.layoutManager};
+    assert.equal(h.card(manager.pending()), undefined, 'layout manager identity is mandatory');
+    manager._layoutManager = h.layoutManager;
+    const nested = new h.TransitionBackground();
+    const nestedGroup = nested._bgManager._container;
+    const bin = new Actor();
+    nested.remove_child(nestedGroup);
+    nested.add_child(bin);
+    bin.add_child(nestedGroup);
+    nested.emit('notify::allocation');
+    assert.equal(h.card(nested._bgManager.backgroundActor), undefined, 'native group must be a direct child');
+    assert.equal(h.card(nested._bgManager.pending()), undefined);
+    h.flush();
+    assert.equal(h.card(manager.backgroundActor), clone);
+    assert.equal(h.clones.filter(actor => !actor.destroyed).length, 2);
+    assert.equal(h.errors.length, 0);
     h.owner.destroy();
     h.assertClean();
+});
+
+test('monitor object replacement is rejected before monitors-changed, even at the same index', async () => {
+    for (const ownerType of ['WorkspaceBackground', 'TransitionBackground']) {
+        const h = await harness();
+        h.owner.start();
+        const existing = new h[ownerType]();
+        h.owner.setVisibility(true, true);
+        const clone = h.card(existing._bgManager.backgroundActor);
+        assert.equal(clone.visible, true);
+        h.layoutManager.monitors[0] = {...h.monitor};
+        const replacement = new h[ownerType]();
+        assert.equal(h.card(replacement._bgManager.backgroundActor), undefined);
+        assert.equal(clone.visible, false);
+        assert.equal(h.backdrop().visible, false);
+        h.owner.setVisibility(true, true);
+        assert.equal(clone.visible, false);
+        h.layoutManager.emit('monitors-changed');
+        assert.equal(clone.visible, false);
+        assert.equal(h.errors.length, 0);
+        h.owner.destroy();
+        h.assertClean();
+    }
 });
 
 test('background replacement, pending supersession, fading, destruction and dedup use actor identity', async () => {
-    const h = await harness();
-    h.owner.start();
-    h.owner.setVisibility(true, true);
-    const workspace = new h.WorkspaceBackground();
-    const manager = workspace._bgManager;
-    const first = manager.backgroundActor;
-    const firstClone = h.card(first);
-    const superseded = manager.pending();
-    const supersededClone = h.card(superseded);
-    const pending = manager.pending();
-    assert.ok(supersededClone.destroyed);
-    manager.swap();
-    workspace.nativeAllocate();
-    h.flush();
-    const pendingClone = h.card(pending);
-    for (let i = 0; i < 3; i++) {
-        workspace.emit('notify::allocation');
+    for (const ownerType of ['WorkspaceBackground', 'TransitionBackground']) {
+        const h = await harness();
+        h.owner.start();
         h.owner.setVisibility(true, true);
+        const workspace = new h[ownerType]();
+        const manager = workspace._bgManager;
+        const first = manager.backgroundActor;
+        const firstClone = h.card(first);
+        const superseded = manager.pending();
+        const supersededClone = h.card(superseded);
+        const pending = manager.pending();
+        assert.ok(supersededClone.destroyed);
+        assert.equal(h.laters.size, 2, 'supersession cancels the old actor readiness callback');
+        manager.swap();
+        if (ownerType === 'WorkspaceBackground')
+            workspace.nativeAllocate();
+        h.flush();
+        const pendingClone = h.card(pending);
+        for (let i = 0; i < 3; i++) {
+            workspace.emit('notify::allocation');
+            h.owner.setVisibility(true, true);
+        }
+        assert.equal(h.card(first), firstClone);
+        assert.equal(h.card(pending), pendingClone);
+        assert.equal(firstClone.visible, true, 'retain the native fading actor until native destruction');
+        first.destroy();
+        assert.ok(firstClone.destroyed);
+        assert.equal(first.handlers.size, 0);
+        const last = manager.pending();
+        manager.swap(true);
+        assert.ok(pendingClone.destroyed, 'immediate native destruction is also pruned');
+        const lastClone = h.card(last);
+        lastClone.destroy();
+        assert.equal(last.handlers.size, 0, 'external clone destruction releases parent tracking');
+        assert.equal(workspace.handlers.size, 0);
+        assert.ok(!last.destroyed, 'never destroy the native parent');
+        assert.equal(h.laters.size, 0);
+        h.owner.destroy();
+        h.assertClean();
     }
-    assert.equal(h.card(first), firstClone);
-    assert.equal(h.card(pending), pendingClone);
-    assert.equal(firstClone.visible, true, 'retain the native fading actor until native destruction');
-    first.destroy();
-    assert.ok(firstClone.destroyed);
-    assert.equal(first.handlers.size, 0);
-    const last = manager.pending();
-    manager.swap(true);
-    assert.ok(pendingClone.destroyed, 'immediate native destruction is also pruned');
-    const lastClone = h.card(last);
-    lastClone.destroy();
-    assert.equal(last.handlers.size, 0, 'external clone destruction releases parent tracking');
-    assert.equal(workspace.handlers.size, 0);
-    assert.ok(!last.destroyed, 'never destroy the native parent');
-    assert.equal(h.idles.size, 0);
-    h.owner.destroy();
-    h.assertClean();
 });
 
 test('native parent removal or owner destruction prunes only extension resources', async () => {
-    const h = await harness();
-    h.owner.start();
-    const workspace = new h.WorkspaceBackground();
-    const background = workspace._bgManager.backgroundActor;
-    const clone = h.card(background);
-    workspace._backgroundGroup.remove_child(background);
-    assert.ok(clone.destroyed);
-    assert.ok(!background.destroyed);
-    const other = new h.WorkspaceBackground();
-    const otherClone = h.card(other._bgManager.backgroundActor);
-    other.destroy();
-    assert.ok(otherClone.destroyed);
-    h.owner.destroy();
-    h.assertClean();
+    for (const ownerType of ['WorkspaceBackground', 'TransitionBackground']) {
+        const h = await harness();
+        h.owner.start();
+        const workspace = new h[ownerType]();
+        const background = workspace._bgManager.backgroundActor;
+        const clone = h.card(background);
+        workspace._bgManager._container.remove_child(background);
+        assert.ok(clone.destroyed);
+        assert.ok(!background.destroyed);
+        assert.equal(h.laters.size, 0, 'native removal cancels readiness before it can run');
+        const foreignParent = new Actor();
+        h.uiGroup.add_child(foreignParent);
+        foreignParent.add_child(background);
+        background.allocate(0, 0, 1920, 1080);
+        assert.equal(h.card(background), undefined, 'changed native ancestry cannot revive a retired clone');
+        const other = new h[ownerType]();
+        const otherClone = h.card(other._bgManager.backgroundActor);
+        other.destroy();
+        assert.ok(otherClone.destroyed);
+        assert.ok(other._bgManager.backgroundActor.destroyed, 'native owner destruction is modelled separately');
+        assert.equal(h.laters.size, 0, 'native destruction cancels readiness before it can run');
+        h.owner.destroy();
+        h.assertClean();
+    }
 });
 
-test('cleanup retains failed clone/signal/idle/effect/constraint ownership and retries after disable', async () => {
-    const h = await harness();
-    h.owner.start();
-    const workspace = new h.WorkspaceBackground();
-    h.owner.setVisibility(true, true);
-    const background = workspace._bgManager.backgroundActor;
-    const clone = h.card(background);
-    clone.destroyError = clone.effectError = clone.constraintError = true;
-    background.disconnectError = true;
-    h.theme.disconnectError = true;
-    h.idleRemoveError = true;
-    assert.throws(() => h.owner.destroy(), /Overview cleanup failed/);
-    assert.equal(h.owner.hasResources, true);
-    assert.equal(clone.visible, false);
-    assert.equal(clone.source, null);
-    assert.equal(clone.effects.length, 1);
-    assert.equal(clone.constraints.length, 1);
-    assert.equal(h.idles.size, 1);
-    assert.ok(background.handlers.size > 0);
-    assert.deepEqual(Object.getOwnPropertyDescriptor(h.BackgroundManager.prototype,
-        '_createBackgroundActor'), h.originalDescriptor, 'hook already deactivated/restored');
-    h.owner.setVisibility(true, true);
-    const later = new h.WorkspaceBackground();
-    assert.equal(h.card(later._bgManager.backgroundActor), undefined);
-    clone.destroyError = clone.effectError = clone.constraintError = false;
-    background.disconnectError = false;
-    h.theme.disconnectError = false;
-    h.idleRemoveError = false;
-    h.owner.destroy();
-    h.owner.destroy();
-    h.assertClean();
-    assert.ok(!background.destroyed);
+test('cleanup retains failed clone/signal/later/effect/constraint ownership and retries after disable', async () => {
+    for (const ownerType of ['WorkspaceBackground', 'TransitionBackground']) {
+        const h = await harness();
+        h.owner.start();
+        const workspace = new h[ownerType]();
+        h.owner.setVisibility(true, true);
+        const background = workspace._bgManager.backgroundActor;
+        const clone = h.card(background);
+        clone.destroyError = clone.effectError = clone.constraintError = true;
+        background.disconnectError = true;
+        h.theme.disconnectError = true;
+        h.laterRemoveError = true;
+        assert.throws(() => h.owner.destroy(), /Overview cleanup failed/);
+        assert.equal(h.owner.hasResources, true);
+        assert.equal(clone.visible, false);
+        assert.equal(clone.source, null);
+        assert.equal(clone.effects.length, ownerType === 'WorkspaceBackground' ? 1 : 0);
+        assert.equal(clone.constraints.length, 1);
+        assert.equal(h.laters.size, 1);
+        assert.ok(background.handlers.size > 0);
+        assert.deepEqual(Object.getOwnPropertyDescriptor(h.BackgroundManager.prototype,
+            '_createBackgroundActor'), h.originalDescriptor, 'hook already deactivated/restored');
+        h.owner.setVisibility(true, true);
+        const later = new h[ownerType]();
+        assert.equal(h.card(later._bgManager.backgroundActor), undefined);
+        clone.destroyError = clone.effectError = clone.constraintError = false;
+        background.disconnectError = false;
+        h.theme.disconnectError = false;
+        h.laterRemoveError = false;
+        h.owner.destroy();
+        h.owner.destroy();
+        h.assertClean();
+        assert.ok(!background.destroyed);
+    }
 });
 
 test('hook restoration failure stays owned and inactive until a later cleanup succeeds', async () => {
@@ -738,35 +1064,46 @@ test('hook restoration failure stays owned and inactive until a later cleanup su
     h.assertClean();
 });
 
-test('an idle that could not be cancelled releases ownership when it naturally runs', async () => {
-    const h = await harness();
-    h.owner.start();
-    new h.WorkspaceBackground();
-    h.idleRemoveError = true;
-    assert.throws(() => h.owner.destroy(), /idle removal failed/);
-    assert.equal(h.owner.hasResources, true);
-    assert.equal(h.idles.size, 1);
-    h.flush();
-    h.assertClean();
+test('a before-redraw later that could not be cancelled releases ownership when it naturally runs', async () => {
+    for (const ownerType of ['WorkspaceBackground', 'TransitionBackground']) {
+        const h = await harness();
+        h.owner.start();
+        const workspace = new h[ownerType]();
+        const background = workspace._bgManager.backgroundActor;
+        h.laterRemoveError = true;
+        assert.throws(() => h.owner.destroy(), /later removal failed/);
+        assert.equal(h.owner.hasResources, true);
+        assert.equal(h.laters.size, 1);
+        h.flush();
+        h.assertClean();
+        h.flush();
+        assert.equal(h.laters.size, 0);
+        assert.equal(workspace.handlers.size, 0);
+        assert.equal(background.handlers.size, 0);
+        assert.ok(!background.destroyed);
+        assert.equal(h.errors.length, 0);
+    }
 });
 
 test('owned source loss reports failure without discovering or substituting another source', async () => {
-    const h = await harness();
-    h.owner.start();
-    const workspace = new h.WorkspaceBackground();
-    h.owner.setVisibility(true, true);
-    h.sourceActor.destroy();
-    assert.equal(h.errors.length, 1);
-    assert.match(h.errors[0].message, /source actor was destroyed/);
-    assert.ok(h.clones.every(clone => !clone.visible));
-    const later = new h.WorkspaceBackground();
-    assert.equal(h.card(later._bgManager.backgroundActor), undefined);
-    h.owner.destroy();
-    assert.equal(h.owner.hasResources, false);
-    assert.equal(h.idles.size, 0);
-    assert.equal(workspace.handlers.size, 0);
-    assert.equal(workspace._bgManager.backgroundActor.handlers.size, 0);
-    assert.ok(!workspace._bgManager.backgroundActor.destroyed);
+    for (const ownerType of ['WorkspaceBackground', 'TransitionBackground']) {
+        const h = await harness();
+        h.owner.start();
+        const workspace = new h[ownerType]();
+        h.owner.setVisibility(true, true);
+        h.sourceActor.destroy();
+        assert.equal(h.errors.length, 1);
+        assert.match(h.errors[0].message, /source actor was destroyed/);
+        assert.ok(h.clones.every(clone => !clone.visible));
+        const later = new h[ownerType]();
+        assert.equal(h.card(later._bgManager.backgroundActor), undefined);
+        h.owner.destroy();
+        assert.equal(h.owner.hasResources, false);
+        assert.equal(h.laters.size, 0);
+        assert.equal(workspace.handlers.size, 0);
+        assert.equal(workspace._bgManager.backgroundActor.handlers.size, 0);
+        assert.ok(!workspace._bgManager.backgroundActor.destroyed);
+    }
 });
 
 test('extension failures report once and never escape the native factory, including a throwing reporter', async () => {
@@ -790,13 +1127,15 @@ test('extension failures report once and never escape the native factory, includ
 });
 
 test('startup and later geometry failures retain resources for the session owner to clean', async () => {
-    for (const failure of ['cloneError', 'idleAddError', 'uniformError']) {
+    for (const [failure, ownerType] of [['cloneError', 'WorkspaceBackground'],
+        ['laterAddError', 'WorkspaceBackground'], ['uniformError', 'WorkspaceBackground'],
+        ['laterAddError', 'TransitionBackground']]) {
         const h = await harness({onError: owner => owner.owner.destroy()});
         if (failure === 'cloneError')
             h.cloneError = true;
         h.owner.start();
         if (failure !== 'cloneError') {
-            const workspace = new h.WorkspaceBackground();
+            const workspace = new h[ownerType]();
             h[failure] = true;
             if (failure === 'uniformError')
                 workspace.state(1);
@@ -804,6 +1143,7 @@ test('startup and later geometry failures retain resources for the session owner
                 workspace._bgManager.pending();
         }
         assert.equal(h.errors.length, 1, failure);
+        assert.equal(h.laters.size, 0, 'failed scheduling must not leave unbounded callbacks');
         h.assertClean();
     }
 });
