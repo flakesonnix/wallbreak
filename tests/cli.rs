@@ -4,6 +4,67 @@ use image::{Rgba, RgbaImage};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_wallbreak");
 
+#[test]
+fn plasma_rejects_animation_and_output_selection_without_touching_the_desktop() {
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("image.png");
+    let video = directory.path().join("video.mp4");
+    RgbaImage::new(2, 2).save(&image).unwrap();
+    fs::write(&video, b"not decoded by the Plasma image backend").unwrap();
+    for (path, args, expected) in [
+        (&video, vec![], "static images only"),
+        (&image, vec!["--output", "DP-1"], "omit --output"),
+    ] {
+        let output = Command::new(BINARY)
+            .arg("play")
+            .arg(path)
+            .args(args)
+            .env("XDG_CURRENT_DESKTOP", "custom:KDE")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent-wallbreak-test-bus",
+            )
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
+            .env("PATH", "/no-helpers")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(
+            !error.contains("Wayland"),
+            "must not fall back to layer-shell: {error}"
+        );
+    }
+}
+
+#[test]
+fn plasma_validates_images_before_opening_dbus_or_mutating_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("broken.png");
+    fs::write(&image, b"not an image").unwrap();
+    let output = Command::new(BINARY)
+        .arg("play")
+        .arg(&image)
+        .env("XDG_CURRENT_DESKTOP", "Plasma")
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent-wallbreak-test-bus",
+        )
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("PATH", "/no-helpers")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("image decoding failed; desktop unchanged"),
+        "{error}"
+    );
+    assert!(!error.contains("requires XDG_RUNTIME_DIR"), "{error}");
+}
+
 fn scene_fixture(root: &Path) {
     fs::create_dir_all(root.join("models")).unwrap();
     fs::create_dir_all(root.join("materials")).unwrap();

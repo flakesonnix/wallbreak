@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use wallbreak::{
     display, gnome, log, log_debug, log_info,
     media::{Fit, MediaWorker, PlaybackOptions},
-    project, steam,
+    plasma, project, steam,
 };
 
 #[derive(Parser)]
@@ -42,7 +42,7 @@ enum Action {
     Projects,
     /// Print the optional GNOME 50 extension archive path; never install or enable it.
     GnomeExtension,
-    /// Play until Ctrl-C: one layer-shell output, or a static image on all GNOME displays.
+    /// Play until Ctrl-C: one layer-shell output, or native GNOME/Plasma backgrounds.
     Play {
         path: PathBuf,
         /// Select the project's static preview instead of rendering its scene or web content.
@@ -178,6 +178,8 @@ fn run(command: Action) -> Result<()> {
             };
             if gnome::is_current() {
                 gnome::run(&media, &options, output.as_deref(), stop)?;
+            } else if plasma::is_current() {
+                plasma::run(&media, &options, output.as_deref(), stop)?;
             } else {
                 display::run(media, options, output, stop)?;
             }

@@ -6,6 +6,8 @@ GNOME has a static-image backend using `gsettings` and an optional GNOME 50
 Shell bridge for videos and supported animated scenes. The bridge must be
 installed and enabled separately; wallbreak never substitutes a foreground
 window when it is unavailable.
+KDE Plasma has an experimental native static-image backend using its session
+D-Bus scripting API. Plasma video/scene integration is not implemented yet.
 It is not a full Wallpaper Engine clone. No Steam,
 Wine, or Wallpaper Engine executable is launched.
 
@@ -71,6 +73,36 @@ can prevent restoration; those cases are not a persistent configuration service.
 ```bash
 nix run .#cli -- play /absolute/path/to/image.jpg --duration-seconds 15
 ```
+
+### KDE Plasma Images
+
+On KDE Plasma, direct images and explicit project previews use the native
+`org.kde.image` wallpaper plugin, not a layer-shell surface underneath Plasma's
+desktop. No extension, `qdbus` executable, or Qt dependency is needed by wallbreak.
+Leave output selection at **default** and omit `--output`: this initial backend
+changes all connected displays in the activity that was current at startup.
+It does not follow activity switches or newly connected displays.
+
+```bash
+wallbreak play /absolute/path/to/image.jpg --fit contain --duration-seconds 15
+wallbreak play /absolute/path/to/project --preview
+```
+
+Stop, SIGINT/SIGTERM, GUI close, and duration expiry restore each desktop's prior
+plugin and effective image/fit/color/blur settings if they are still owned by
+wallbreak. User-changed wallpapers are retained. Other plugins' configuration
+groups are not rewritten. A per-user runtime lock rejects concurrent Plasma
+players; a temporary `Wallbreak/Owner` config value identifies owned desktops
+and is cleared during cleanup. Missing config values may be restored as explicit
+defaults. SIGKILL, shell crashes/restarts, power loss, and D-Bus failures can
+prevent restoration; no persistent recovery service is installed.
+
+Videos and animated scenes fail explicitly instead of silently falling back to
+an unreliable Plasma layer-shell background. Select **Use project preview** for
+a static scene image. The D-Bus/script contract was checked against Plasma 6.4
+sources and has isolated Rust protocol/script tests; live Plasma appearance,
+plugin loading, activity changes, and restoration still need validation before
+this draft support is considered complete.
 
 ### GNOME Animation
 
@@ -176,6 +208,7 @@ installation and activation.
 | --- | --- |
 | GNOME bridge renderer | `src/renderer.rs` uses `glow` paint callbacks and `src/gpu.rs` to draw supported scenes, decoded images, and uploaded I420/YUV video planes. Video YUV-to-RGB conversion runs in a shader. |
 | GNOME static images | Public image and `--preview` playback uses `gsettings`, not the bridge renderer's image draw path. |
+| KDE Plasma static images | `src/plasma.rs` temporarily selects the native image plugin through session D-Bus. All connected displays in the initial activity; no video/scene renderer yet. |
 | Sway / `wlr-layer-shell` | `src/display.rs` presents CPU-rendered/decoded frames through `wl_shm` XRGB buffers. It does not use the GPU renderer. |
 | CLI `check` / GUI previews | `MediaWorker` produces CPU frames. The GUI displays a finished preview as an egui texture, not through the scene/YUV GPU callbacks. |
 
@@ -309,8 +342,15 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --features gui --all-targets -- -D warnings
 cargo test --locked --features gui
+cargo test --locked --test plasma
 nix flake check .
 ```
+
+The Plasma tests run the production-generated script in an embedded QuickJS
+engine through the test-only `rquickjs` dependency. Their Rust fixtures simulate
+Plasma configuration and deferred plugin switching; no Node.js or running
+Plasma session is needed. Building these tests requires a C compiler for QuickJS.
+Node.js is still used separately for the existing GNOME extension tests.
 
 The default Cargo test runs ignore tests requiring external programs or an
 explicitly selected EGL library. The Nix package check is configured to include
@@ -447,6 +487,8 @@ rendering-performance comparison or a 4K/60-fps claim.
 
 ## TODO
 
+- [ ] Validate native image playback and cleanup in a live Plasma 6 session,
+  then add native video/animated-scene integration and per-output selection.
 - [ ] Add an EGL GPU presenter for `wlr-layer-shell` with automatic CPU/SHM
   fallback and an explicit `--software` override.
 - [ ] Check real GNOME 50 playback after a Shell reload: scene/video appearance,
