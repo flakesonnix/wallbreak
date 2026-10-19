@@ -11,6 +11,7 @@ pub mod library;
 pub mod log;
 pub mod media;
 mod pkg;
+pub mod plasma;
 pub mod project;
 #[cfg(feature = "gui")]
 pub mod renderer;

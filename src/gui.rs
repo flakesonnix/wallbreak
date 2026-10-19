@@ -1805,6 +1805,9 @@ pub mod panel {
             if crate::gnome::is_current() {
                 ui.separator();
                 ui.small("GNOME: animation requires the optional GNOME 50 Shell bridge. Static images need no extension.");
+            } else if crate::plasma::is_current() {
+                ui.separator();
+                ui.small("KDE Plasma: static images only, on all displays in the current activity. Leave output selection unset; use project preview for scenes.");
             }
         }
 
