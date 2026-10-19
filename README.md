@@ -100,7 +100,7 @@ prevent restoration; no persistent recovery service is installed.
 Videos and animated scenes fail explicitly instead of silently falling back to
 an unreliable Plasma layer-shell background. Select **Use project preview** for
 a static scene image. The D-Bus/script contract was checked against Plasma 6.4
-sources and has isolated protocol/simulated-script tests; live Plasma appearance,
+sources and has isolated Rust protocol/script tests; live Plasma appearance,
 plugin loading, activity changes, and restoration still need validation before
 this draft support is considered complete.
 
@@ -342,9 +342,15 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --features gui --all-targets -- -D warnings
 cargo test --locked --features gui
-node --test tests/plasma.test.mjs
+cargo test --locked --test plasma
 nix flake check .
 ```
+
+The Plasma tests run the production-generated script in an embedded QuickJS
+engine through the test-only `rquickjs` dependency. Their Rust fixtures simulate
+Plasma configuration and deferred plugin switching; no Node.js or running
+Plasma session is needed. Building these tests requires a C compiler for QuickJS.
+Node.js is still used separately for the existing GNOME extension tests.
 
 The default Cargo test runs ignore tests requiring external programs or an
 explicitly selected EGL library. The Nix package check is configured to include

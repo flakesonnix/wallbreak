@@ -4,6 +4,9 @@
 use wallbreak::{media, project};
 include!("../src/plasma.rs");
 
+#[path = "support/plasma_script.rs"]
+mod script_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
